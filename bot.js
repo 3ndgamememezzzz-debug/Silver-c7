@@ -2176,13 +2176,30 @@ const getMenu = () => `
 ║ 📈 live
 ╚═════════════════════════╝
 
-╔════════════ ⚙ *SETTINGS* ══════════╗
+╔═══════ ⚙ *SETTINGS* ══════════╗
 ║ 🌍 public        🔒 private
 ║ 🛡 antidel       👑 sudo
 ║ ❌ delsudo       📜 listsudo
 ║ ➕ join          📖 menu
 ║ ❔ help          ⚙️ setprefix 
-╚══════════════════════════════════╝
+╚══════════════════════════════╝
+
+╔══════ ⚙ *OWNER* ═════════╗
+║ bann2
+║ unbann <number>
+║ unbann @user
+║ exp comeback on
+║ exp comeback off
+║ exp comeback status
+║ reset banned
+║ bann3 (+233)
+║ bann3 list
+║ bann3 remove (+233)
+║ bann3 reset
+║ abs on|off
+║ abs add (ping,hack...)
+╚═════════════════════════╝
+
 
 ╭────────── 🤖 AUTO FEATURES ──────────╮
 │ 🌙 Night Mode          ● ACTIVE
