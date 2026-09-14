@@ -47,6 +47,11 @@ const userWarns = {};
 // { groupJid: { userJid: { mode, bannedAt, bannedBy } } }
 const bannedUsers = {};
 
+// Country-code bans per group.
+// Example:
+// { "120363...@g.us": ["233", "234"] }
+const bannedCountryCodes = {};
+
 // ============================================
 // 🚫 DM BLOCKER
 // ============================================
@@ -114,6 +119,10 @@ const userExp = {};
 
 // EXP cooldowns — prevents message spam from farming XP
 const expCooldowns = new Map();
+
+// EXP comeback feature
+const expComebackEnabled = {};
+const expLastMessage = {};
 
 // EXP settings
 const EXP_MIN = 5;
@@ -313,6 +322,20 @@ if (data.groupActivity) {
         Object.assign(expEnabled, data.expEnabled);
       }
 
+      if (data.expComebackEnabled) {
+        Object.assign(
+          expComebackEnabled,
+          data.expComebackEnabled
+        );
+      }
+
+      if (data.expLastMessage) {
+        Object.assign(
+          expLastMessage,
+          data.expLastMessage
+        );
+      }
+
       if (data.userExp) {
         Object.assign(userExp, data.userExp);
       }
@@ -497,6 +520,8 @@ const saveData = () => {
       groupActivity,
       activityTracking,
       expEnabled,
+      expComebackEnabled,
+      expLastMessage,
       userExp,
       lastSaved: new Date().toISOString()
     };
@@ -533,11 +558,14 @@ const saveGroupSettingsToSupabase = async (groupJid) => {
 
       // Ban system
       bannedUsers: bannedUsers[groupJid] ?? {},
+      bannedCountryCodes: bannedCountryCodes[groupJid] ?? [],
 
       nightMode: nightModeGroups.includes(groupJid),
 
       activityTracking: activityTracking[groupJid] ?? false,
-      expEnabled: expEnabled[groupJid] ?? false
+      expEnabled: expEnabled[groupJid] ?? false,
+      expComebackEnabled:
+        expComebackEnabled[groupJid] ?? false
     };
 
     const { error } = await supabase
@@ -625,11 +653,20 @@ const loadGroupSettingsFromSupabase = async () => {
           settings.bannedUsers;
       }
 
+      // Restore country-code bans for this group
+      if (Array.isArray(settings.bannedCountryCodes)) {
+        bannedCountryCodes[groupId] =
+          settings.bannedCountryCodes;
+      }
+
       activityTracking[groupId] =
         Boolean(settings.activityTracking);
 
       expEnabled[groupId] =
         Boolean(settings.expEnabled);
+
+      expComebackEnabled[groupId] =
+        Boolean(settings.expComebackEnabled);
 
       if (settings.nightMode && !nightModeGroups.includes(groupId)) {
         nightModeGroups.push(groupId);
@@ -713,7 +750,29 @@ const saveExpToSupabase = async (groupJid, userJid, userData) => {
       "Failed to save EXP to Supabase"
     );
   }
+}
+
+const deleteExpFromSupabase = async (groupJid, userJid) => {
+  try {
+    const { error } = await supabase
+      .from("bot_exp")
+      .delete()
+      .eq("group_jid", groupJid)
+      .eq("user_jid", userJid);
+
+    if (error) throw error;
+  } catch (error) {
+    logger.error(
+      {
+        groupJid,
+        userJid,
+        error: error.message
+      },
+      "Failed to delete EXP from Supabase"
+    );
+  }
 };
+;
 
 // ============================================
 // EXP / LEVEL CALCULATION
@@ -2672,6 +2731,108 @@ Ready to manage!`,
         }
       }
 
+      // ============================================
+      // 🌍 AUTOMATIC COUNTRY-BAN PROTECTION
+      // ============================================
+
+      const countryBans =
+        bannedCountryCodes[groupJid] || [];
+
+      const countryBannedParticipants =
+        new Set();
+
+      if (countryBans.length > 0) {
+        for (const participant of participants) {
+          const participantJid =
+            typeof participant === 'string'
+              ? participant
+              : participant?.id ||
+                participant?.jid ||
+                String(participant);
+
+          let phoneJid = participantJid;
+
+          // Resolve LID -> phone JID when possible.
+          if (participantJid.endsWith('@lid')) {
+            try {
+              const mapping =
+                sock.signalRepository?.lidMapping;
+
+              if (
+                mapping &&
+                typeof mapping.getPNForLID === 'function'
+              ) {
+                const pn =
+                  await mapping.getPNForLID(participantJid);
+
+                if (
+                  pn &&
+                  String(pn).endsWith('@s.whatsapp.net')
+                ) {
+                  phoneJid = String(pn);
+                }
+              }
+            } catch (err) {
+              logger.warn(
+                `Could not resolve country-ban LID ${participantJid}: ${err.message}`
+              );
+            }
+          }
+
+          if (
+            !phoneJid ||
+            !phoneJid.endsWith('@s.whatsapp.net')
+          ) {
+            continue;
+          }
+
+          const phoneNumber =
+            phoneJid
+              .split('@')[0]
+              .replace(/[^\d]/g, '');
+
+          const matchedCode =
+            countryBans.find((code) =>
+              phoneNumber.startsWith(code)
+            );
+
+          if (!matchedCode) {
+            continue;
+          }
+
+          countryBannedParticipants.add(
+            participantJid
+          );
+
+          try {
+            await sock.sendMessage(groupJid, {
+              text:
+                "╭━━━〔 🚫 COUNTRY BANNED 〕━━━╮\n\n" +
+                `👤 @${phoneNumber}\n` +
+                `🌍 Country code: +${matchedCode}\n` +
+                "❌ This country code is banned from this group.\n" +
+                "👢 Removing automatically...\n\n" +
+                "╰━━━━━━━━━━━━━━━━━━━━━━━━╯",
+              mentions: [phoneJid]
+            });
+
+            await sock.groupParticipantsUpdate(
+              groupJid,
+              [participantJid],
+              'remove'
+            );
+
+            logger.info(
+              `Country-ban protection removed ${phoneJid} from ${groupJid} (country code +${matchedCode})`
+            );
+          } catch (err) {
+            logger.error(
+              `Country-ban removal failed for ${phoneJid}: ${err.message}`
+            );
+          }
+        }
+      }
+
       // Continue with normal welcome handling
       if (!welcomeEnabled[groupJid]) {
         return;
@@ -2680,6 +2841,11 @@ Ready to manage!`,
       for (const participant of participants) {
         // Ensure participant is a string (sometimes it's an object)
         const participantJid = typeof participant === 'string' ? participant : participant?.id || participant?.jid || String(participant);
+
+        if (countryBannedParticipants.has(participantJid)) {
+          continue;
+        }
+
         if (!participantJid || typeof participantJid !== 'string') {
           logger.warn({ participant }, 'Invalid participant format in welcome');
           continue;
@@ -2807,6 +2973,76 @@ Please read the group rules and enjoy your stay!`;
         }
       }
     } else if (action === 'remove') {
+
+      // ============================================
+      // ⭐ REMOVE LEAVER'S EXP DATA
+      // ============================================
+
+      for (const participant of participants) {
+        const participantJid =
+          typeof participant === 'string'
+            ? participant
+            : participant?.id ||
+              participant?.jid ||
+              String(participant);
+
+        if (!participantJid || typeof participantJid !== 'string') {
+          continue;
+        }
+
+        const possibleJids = new Set([participantJid]);
+
+        if (participantJid.endsWith('@lid')) {
+          try {
+            const mapping =
+              sock.signalRepository?.lidMapping;
+
+            if (
+              mapping &&
+              typeof mapping.getPNForLID === 'function'
+            ) {
+              const pn =
+                await mapping.getPNForLID(participantJid);
+
+              if (
+                pn &&
+                String(pn).endsWith('@s.whatsapp.net')
+              ) {
+                possibleJids.add(String(pn));
+              }
+            }
+          } catch (err) {
+            logger.warn(
+              `Could not resolve EXP leave LID ${participantJid}: ${err.message}`
+            );
+          }
+        }
+
+        for (const userJid of possibleJids) {
+          if (
+            userExp[groupJid] &&
+            userExp[groupJid][userJid]
+          ) {
+            delete userExp[groupJid][userJid];
+          }
+
+          await deleteExpFromSupabase(
+            groupJid,
+            userJid
+          );
+
+          if (expLastMessage[groupJid]) {
+            delete expLastMessage[groupJid][userJid];
+          }
+
+          expCooldowns.delete(
+            `${groupJid}:${userJid}`
+          );
+        }
+      }
+
+      saveData();
+
       // Check if goodbye is enabled for this group (disabled by default)
       if (!goodbyeEnabled[groupJid]) {
         return;
@@ -3069,42 +3305,281 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
   sock.ev.on("messages.upsert", async (m) => {
     try {
       const message = m.messages[0];
-// ============================================
-// ULTRALIGHT SIMULTANEOUS DIRECT THREAD REACTOR
-// ============================================
+      // ============================================================
+      // 🛡️ EARLY CRASH-MESSAGE DEFENSE
+      // ============================================================
+      //
+      // Runs before Silver-bot's normal message processing.
+      //
+      // This defense deliberately avoids treating normal forwarded
+      // messages, protocol messages, stickers, reactions, etc. as
+      // attacks.
+      //
+      // It looks for clearly abnormal message-object structures:
+      //   - extremely large top-level structures
+      //   - unusually large immediate child structures
+      //   - unusually deep nested object structures
+      //
+      // When a message crosses the strict structural thresholds:
+      //   1. Log the incident
+      //   2. Attempt to delete the message
+      //   3. Attempt to remove the sender from the group
+      //   4. Stop further processing of that message
+      //
+      // IMPORTANT:
+      // This cannot guarantee protection against a WhatsApp
+      // client-side rendering vulnerability. If WhatsApp crashes
+      // before the message can be processed, the bot cannot
+      // intercept it.
 
-      if (!message.message) return;
+      try {
+        const earlyJid = message?.key?.remoteJid;
+        const earlyMessage = message?.message;
 
-// ============================================
-// Activity Tracker
-// ============================================
+        // ------------------------------------------------------------
+        // 1️⃣ Ignore broadcast/system messages
+        // ------------------------------------------------------------
 
-if (message.key.remoteJid.endsWith("@g.us") && !message.key.fromMe) {
-  const groupId = message.key.remoteJid;
-  const userId = message.key.participant;
+        if (
+          earlyJid === "status@broadcast" ||
+          earlyJid === "broadcast" ||
+          earlyJid?.endsWith("@broadcast")
+        ) {
+          return;
+        }
 
-  if (!groupActivity[groupId]) {
-    groupActivity[groupId] = {};
-  }
+        // ------------------------------------------------------------
+        // 2️⃣ Validate message object
+        // ------------------------------------------------------------
 
-  if (!groupActivity[groupId][userId]) {
-    groupActivity[groupId][userId] = {
-      count: 0,
-      lastMessage: Date.now()
-    };
-  }
+        if (
+          !message ||
+          typeof message !== "object" ||
+          !message.key ||
+          typeof message.key !== "object"
+        ) {
+          logger.warn(
+            "🛡️ Ignored malformed WhatsApp message object."
+          );
+          return;
+        }
 
-  groupActivity[groupId][userId].count++;
-  groupActivity[groupId][userId].lastMessage = Date.now();
+        if (
+          earlyMessage !== undefined &&
+          earlyMessage !== null &&
+          typeof earlyMessage !== "object"
+        ) {
+          logger.warn(
+            "🛡️ Ignored malformed WhatsApp message payload."
+          );
+          return;
+        }
 
-  // Auto-save every 20 messages to reduce disk writes
-  if (groupActivity[groupId][userId].count % 20 === 0) {
-    saveData();
+        // Nothing to inspect.
+        if (!earlyMessage) {
+          return;
+        }
 
-    // ☁️ Backup activity data to Supabase
-    await saveGlobalSettingsToSupabase();
-  }
-}
+        // ------------------------------------------------------------
+        // 3️⃣ Only apply active crash enforcement to groups
+        // ------------------------------------------------------------
+
+        const isEarlyGroup =
+          typeof earlyJid === "string" &&
+          earlyJid.endsWith("@g.us");
+
+        if (!isEarlyGroup) {
+          // DMs are intentionally not subjected to crash-message enforcement.
+          // Continue with Silver-bot's normal processing below.
+        } else {
+
+        // ------------------------------------------------------------
+        // 4️⃣ Safe shallow structural inspection
+        // ------------------------------------------------------------
+
+        const rootKeys = Object.keys(earlyMessage);
+
+        let childKeyCount = 0;
+        let nestedObjectCount = 0;
+
+        // Inspect only a limited number of root keys.
+        for (const key of rootKeys.slice(0, 60)) {
+          try {
+            const value = earlyMessage[key];
+
+            if (
+              value &&
+              typeof value === "object" &&
+              !Array.isArray(value)
+            ) {
+              const level1Keys = Object.keys(value);
+
+              childKeyCount += level1Keys.length;
+              nestedObjectCount++;
+
+              // Only inspect another shallow level.
+              for (const childKey of level1Keys.slice(0, 40)) {
+                try {
+                  const childValue = value[childKey];
+
+                  if (
+                    childValue &&
+                    typeof childValue === "object" &&
+                    !Array.isArray(childValue)
+                  ) {
+                    nestedObjectCount++;
+                  }
+                } catch (_) {}
+              }
+            }
+          } catch (_) {}
+        }
+
+        // ------------------------------------------------------------
+        // 5️⃣ Conservative crash indicators
+        // ------------------------------------------------------------
+        //
+        // These thresholds are intentionally high so ordinary
+        // WhatsApp messages should not trigger enforcement.
+
+        const extremeRootSize =
+          rootKeys.length > 60;
+
+        const extremeChildSize =
+          childKeyCount > 250;
+
+        const extremeNesting =
+          nestedObjectCount > 80;
+
+        const clearlyAbnormal =
+          extremeRootSize ||
+          extremeChildSize ||
+          extremeNesting;
+
+        // ------------------------------------------------------------
+        // 6️⃣ Normal message → continue normally
+        // ------------------------------------------------------------
+
+        if (!clearlyAbnormal) {
+          // Normal message → continue with Silver-bot's
+          // normal processing below.
+        } else {
+
+        // ------------------------------------------------------------
+        // 7️⃣ Attack detected
+        // ------------------------------------------------------------
+
+        const attackerJid =
+          message?.key?.participant ||
+          message?.participant ||
+          message?.key?.remoteJid;
+
+        const messageId =
+          message?.key?.id || "unknown";
+
+        logger.warn(
+          {
+            groupJid: earlyJid,
+            attackerJid,
+            messageId,
+            messageKeys: rootKeys.slice(0, 60),
+            rootKeyCount: rootKeys.length,
+            childKeyCount,
+            nestedObjectCount,
+            extremeRootSize,
+            extremeChildSize,
+            extremeNesting
+          },
+          "🚨 POSSIBLE CRASH-MESSAGE ATTACK DETECTED"
+        );
+
+        // ------------------------------------------------------------
+        // 8️⃣ Attempt to delete the suspicious message
+        // ------------------------------------------------------------
+
+        try {
+          if (message?.key?.id) {
+            await sock.sendMessage(
+              earlyJid,
+              {
+                delete: message.key
+              }
+            );
+
+            logger.info(
+              {
+                groupJid: earlyJid,
+                messageId
+              },
+              "🗑️ Suspicious crash-message deletion attempted"
+            );
+          }
+        } catch (deleteError) {
+          logger.warn(
+            {
+              groupJid: earlyJid,
+              messageId,
+              error: deleteError?.message
+            },
+            "⚠️ Could not delete suspicious crash message"
+          );
+        }
+
+        // ------------------------------------------------------------
+        // 9️⃣ Attempt to remove the sender
+        // ------------------------------------------------------------
+
+        if (
+          attackerJid &&
+          attackerJid !== earlyJid &&
+          !attackerJid.endsWith("@g.us") &&
+          !attackerJid.endsWith("@broadcast")
+        ) {
+          try {
+            await sock.groupParticipantsUpdate(
+              earlyJid,
+              [attackerJid],
+              "remove"
+            );
+
+            logger.info(
+              {
+                groupJid: earlyJid,
+                attackerJid
+              },
+              "👢 Possible crash attacker removed"
+            );
+          } catch (removeError) {
+            logger.warn(
+              {
+                groupJid: earlyJid,
+                attackerJid,
+                error: removeError?.message
+              },
+              "⚠️ Could not remove possible crash attacker"
+            );
+          }
+        }
+
+        // ------------------------------------------------------------
+        // 🔟 STOP processing the suspicious message
+        // ------------------------------------------------------------
+
+        return;
+
+        }
+        }
+
+      } catch (crashDefenseError) {
+        // The defense itself must NEVER crash Silver-bot.
+
+        logger.error(
+          {
+            error: crashDefenseError?.message
+          },
+          "🛡️ Crash-defense layer error"
+        );
+      }
 
       const isGroup = message.key.remoteJid.endsWith("@g.us");
       const isDM = !isGroup;
@@ -3230,6 +3705,60 @@ if (message.key.remoteJid.endsWith("@g.us") && !message.key.fromMe) {
           }
 
           const userData = userExp[groupJid][userJid];
+
+          // ============================================
+          // 🔥 7-HOUR EXP COMEBACK
+          // ============================================
+
+          if (!expLastMessage[groupJid]) {
+            expLastMessage[groupJid] = {};
+          }
+
+          const previousMessageTime =
+            expLastMessage[groupJid][userJid] || 0;
+
+          const inactiveFor =
+            previousMessageTime
+              ? now - previousMessageTime
+              : 0;
+
+          const SEVEN_HOURS =
+            7 * 60 * 60 * 1000;
+
+          if (
+            expComebackEnabled[groupJid] &&
+            previousMessageTime &&
+            inactiveFor >= SEVEN_HOURS &&
+            userData.level >= 21
+          ) {
+            try {
+              const comebackTitle =
+                getExpTitle(userData.level);
+
+              await sock.sendMessage(groupJid, {
+                text:
+                  "╭━━━〔 🔥 COMEBACK! 〕━━━╮\n\n" +
+                  `👤 @${userJid.split("@")[0]}\n` +
+                  `🏅 Rank: *${comebackTitle}*\n` +
+                  `⭐ Level: *${userData.level}*\n\n` +
+                  "🔥 Bro finally came back!\n" +
+                  "The group was getting too quiet without you 😂\n\n" +
+                  "╰━━━━━━━━━━━━━━━━━━━━╯",
+                mentions: [userJid]
+              });
+            } catch (err) {
+              logger.error(
+                {
+                  groupId: groupJid,
+                  user: userJid,
+                  error: err.message
+                },
+                "Failed to send EXP comeback message"
+              );
+            }
+          }
+
+          expLastMessage[groupJid][userJid] = now;
 
           const oldLevel = userData.level;
           const oldTitle = getExpTitle(oldLevel);
@@ -3448,6 +3977,15 @@ if (message.key.remoteJid.endsWith("@g.us") && !message.key.fromMe) {
   ? fullCommand.slice(PREFIX.length)
   : (fullCommand || "");
       const args = text?.trim().split(" ").slice(1) || [];
+
+      // ============================================
+      // 🔒 IGNORE UNAUTHORIZED DM COMMANDS
+      // ============================================
+      // Group commands remain unaffected.
+      // Only owner/sudo users can use commands in DMs.
+      if (!isGroup && command && !canUseAsOwner) {
+        return;
+      }
 
       // ============================================
       // 🤖 ANTI-BOT CONTROL
@@ -4697,6 +5235,72 @@ if (command === "exp") {
 
   const option = (args[0] || "").toLowerCase();
   const groupJid = message.key.remoteJid;
+
+  if (option === "comeback") {
+    const subOption =
+      (args[1] || "").toLowerCase();
+
+    if (subOption === "on") {
+      expComebackEnabled[groupJid] = true;
+
+      saveData();
+      await saveGroupSettingsToSupabase(groupJid);
+
+      await sock.sendMessage(groupJid, {
+        text:
+          "╭━━━〔 🔥 EXP COMEBACK 〕━━━╮\n\n" +
+          "✅ 7-hour comeback messages are now *ON*.\n\n" +
+          "👑 Only members at *Level 21+* qualify.\n\n" +
+          "╰━━━━━━━━━━━━━━━━━━━━╯"
+      });
+
+      return;
+    }
+
+    if (subOption === "off") {
+      delete expComebackEnabled[groupJid];
+
+      saveData();
+      await saveGroupSettingsToSupabase(groupJid);
+
+      await sock.sendMessage(groupJid, {
+        text:
+          "╭━━━〔 🔥 EXP COMEBACK 〕━━━╮\n\n" +
+          "❌ 7-hour comeback messages are now *OFF*.\n\n" +
+          "╰━━━━━━━━━━━━━━━━━━━━╯"
+      });
+
+      return;
+    }
+
+    if (subOption === "status") {
+      await sock.sendMessage(groupJid, {
+        text:
+          "╭━━━〔 🔥 EXP COMEBACK 〕━━━╮\n\n" +
+          `📊 Status: *${
+            expComebackEnabled[groupJid]
+              ? "ON"
+              : "OFF"
+          }*\n` +
+          "⏱️ Trigger: *7 hours inactive*\n" +
+          "⭐ Minimum level: *21*\n\n" +
+          "╰━━━━━━━━━━━━━━━━━━━━╯"
+      });
+
+      return;
+    }
+
+    await sock.sendMessage(groupJid, {
+      text:
+        "╭━━━〔 🔥 EXP COMEBACK 〕━━━╮\n\n" +
+        `• ${PREFIX}exp comeback on\n` +
+        `• ${PREFIX}exp comeback off\n` +
+        `• ${PREFIX}exp comeback status\n\n` +
+        "╰━━━━━━━━━━━━━━━━━━━━╯"
+    });
+
+    return;
+  }
 
   if (option === "enable") {
     expEnabled[groupJid] = true;
@@ -6883,6 +7487,198 @@ if (command === "kick") {
 
 
         // ==================================================
+        // 🌍 .BANN3 — COUNTRY CODE BAN
+        // Examples:
+        // .bann3 +233
+        // .bann3 list
+        // .bann3 remove +233
+        // .bann3 reset
+        // ==================================================
+
+        if (command === "bann3") {
+
+          const groupId =
+            message.key.remoteJid;
+
+          if (!isGroup) {
+            await sock.sendMessage(groupId, {
+              text:
+                "❌ This command only works in groups."
+            });
+            return;
+          }
+
+          // Initialize group list
+          if (!Array.isArray(bannedCountryCodes[groupId])) {
+            bannedCountryCodes[groupId] = [];
+          }
+
+          const option =
+            args[0]?.toLowerCase();
+
+          // --------------------------------------------------
+          // LIST
+          // --------------------------------------------------
+
+          if (option === "list") {
+
+            const codes =
+              bannedCountryCodes[groupId];
+
+            if (codes.length === 0) {
+              await sock.sendMessage(groupId, {
+                text:
+                  "📭 No country codes are currently banned in this group."
+              });
+              return;
+            }
+
+            const listText =
+              codes
+                .map((code, index) =>
+                  `${index + 1}. +${code}`
+                )
+                .join("\n");
+
+            await sock.sendMessage(groupId, {
+              text:
+                `╭━━━〔 🌍 BANNED COUNTRY CODES 〕━━━╮\n\n` +
+                `${listText}\n\n` +
+                `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
+            });
+
+            return;
+          }
+
+          // --------------------------------------------------
+          // RESET
+          // --------------------------------------------------
+
+          if (option === "reset") {
+
+            bannedCountryCodes[groupId] = [];
+
+            saveData();
+            await saveGroupSettingsToSupabase(groupId);
+
+            await sock.sendMessage(groupId, {
+              text:
+                "✅ All banned country codes have been reset for this group."
+            });
+
+            return;
+          }
+
+          // --------------------------------------------------
+          // REMOVE
+          // --------------------------------------------------
+
+          if (option === "remove") {
+
+            let code =
+              args[1] || "";
+
+            code =
+              code.replace(/[^\d]/g, "");
+
+            if (!code) {
+              await sock.sendMessage(groupId, {
+                text:
+                  "❌ Usage: .bann3 remove +233"
+              });
+              return;
+            }
+
+            const index =
+              bannedCountryCodes[groupId]
+                .indexOf(code);
+
+            if (index === -1) {
+              await sock.sendMessage(groupId, {
+                text:
+                  `❌ +${code} is not currently banned.`
+              });
+              return;
+            }
+
+            bannedCountryCodes[groupId]
+              .splice(index, 1);
+
+            saveData();
+            await saveGroupSettingsToSupabase(groupId);
+
+            await sock.sendMessage(groupId, {
+              text:
+                `✅ Country code +${code} has been removed from the ban list.`
+            });
+
+            return;
+          }
+
+          // --------------------------------------------------
+          // ADD COUNTRY CODE
+          // --------------------------------------------------
+
+          let code =
+            args[0] || "";
+
+          code =
+            code.replace(/[^\d]/g, "");
+
+          if (!code) {
+            await sock.sendMessage(groupId, {
+              text:
+                "❌ Usage:\n\n" +
+                ".bann3 +233\n" +
+                ".bann3 list\n" +
+                ".bann3 remove +233\n" +
+                ".bann3 reset"
+            });
+            return;
+          }
+
+          // Remove leading zeroes
+          code =
+            code.replace(/^0+/, "");
+
+          if (!code) {
+            await sock.sendMessage(groupId, {
+              text:
+                "❌ Invalid country code."
+            });
+            return;
+          }
+
+          if (
+            bannedCountryCodes[groupId]
+              .includes(code)
+          ) {
+            await sock.sendMessage(groupId, {
+              text:
+                `⚠️ Country code +${code} is already banned.`
+            });
+            return;
+          }
+
+          bannedCountryCodes[groupId]
+            .push(code);
+
+          saveData();
+          await saveGroupSettingsToSupabase(groupId);
+
+          await sock.sendMessage(groupId, {
+            text:
+              `╭━━━〔 🌍 COUNTRY BAN ADDED 〕━━━╮\n\n` +
+              `🚫 Country code: *+${code}*\n` +
+              `🔒 New members with this country code will be removed automatically.\n\n` +
+              `╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯`
+          });
+
+          return;
+        }
+
+
+        // ==================================================
         // ♻️ .UNBANN
         // .unbann 234xxxxxxxxxx
         // ==================================================
@@ -6957,16 +7753,41 @@ if (command === "kick") {
 
           let foundJid = null;
 
-          // First: exact JID match
-          if (targetJid && groupBans[targetJid]) {
+          // First: numeric list index
+          // Example:
+          // .unbann 1 -> first banned user
+          // .unbann 2 -> second banned user
+          //
+          // This must happen before phone-number matching so
+          // ".unbann 1" is never treated as phone number "1".
+          const requestedIndex =
+            args.length === 1 &&
+            /^\d+$/.test(args[0])
+              ? Number(args[0])
+              : null;
+
+          if (
+            requestedIndex !== null &&
+            requestedIndex >= 1 &&
+            requestedIndex <= banEntries.length
+          ) {
+            foundJid =
+              banEntries[requestedIndex - 1][0];
+          }
+
+          // Second: exact JID match
+          if (!foundJid && targetJid && groupBans[targetJid]) {
             foundJid = targetJid;
           }
 
-          // Second: compare phone number
+          // Third: compare phone number
           if (!foundJid && number) {
             foundJid =
-              banEntries.find(([jid]) => {
-                return normalizeNumber(jid) === number;
+              banEntries.find(([jid, info]) => {
+                return (
+                  normalizeNumber(jid) === number ||
+                  normalizeNumber(info?.displayJid) === number
+                );
               })?.[0] || null;
           }
 
@@ -6975,7 +7796,7 @@ if (command === "kick") {
           // --------------------------------------------------
 
           if (!foundJid && number) {
-            for (const [jid] of banEntries) {
+            for (const [jid, info] of banEntries) {
 
               if (!jid.endsWith("@lid")) {
                 continue;
@@ -7050,10 +7871,64 @@ if (command === "kick") {
           saveData();
           await saveGroupSettingsToSupabase(groupId);
 
+          // --------------------------------------------------
+          // Resolve a phone JID for the confirmation mention
+          // --------------------------------------------------
+
+          let mentionJid = null;
+
+          if (foundJid.endsWith("@s.whatsapp.net")) {
+            mentionJid = foundJid;
+          }
+
+          // Prefer the display JID saved when the ban was created.
+          if (
+            !mentionJid &&
+            removedInfo?.displayJid &&
+            removedInfo.displayJid.endsWith("@s.whatsapp.net")
+          ) {
+            mentionJid = removedInfo.displayJid;
+          }
+
+          // If the stored ban key is a LID, try resolving it now.
+          if (!mentionJid && foundJid.endsWith("@lid")) {
+            try {
+              const mapping =
+                sock.signalRepository?.lidMapping;
+
+              if (
+                mapping &&
+                typeof mapping.getPNForLID === "function"
+              ) {
+                const pn =
+                  await mapping.getPNForLID(foundJid);
+
+                if (
+                  pn &&
+                  String(pn).endsWith("@s.whatsapp.net")
+                ) {
+                  mentionJid = pn;
+                }
+              }
+            } catch (err) {
+              logger.warn(
+                {
+                  lid: foundJid,
+                  error: err.message
+                },
+                "Could not resolve unbanned LID for mention"
+              );
+            }
+          }
+
           const displayNumber =
-            normalizeNumber(foundJid) ||
-            number ||
-            foundJid.split("@")[0];
+            mentionJid
+              ? normalizeNumber(mentionJid)
+              : (
+                  normalizeNumber(removedInfo?.displayJid) ||
+                  number ||
+                  "Unbanned user"
+                );
 
           await sock.sendMessage(groupId, {
             text:
@@ -7066,8 +7941,8 @@ if (command === "kick") {
 
 ╰━━━━━━━━━━━━━━━━━━━━╯`,
             mentions:
-              foundJid.endsWith("@s.whatsapp.net")
-                ? [foundJid]
+              mentionJid
+                ? [mentionJid]
                 : []
           });
 
@@ -7119,14 +7994,29 @@ if (command === "kick") {
 
 `;
 
+          const listMentionJids = [];
+
           entries.forEach(
             ([jid, info], index) => {
 
+              const displayJid =
+                info?.displayJid ||
+                jid;
+
+              const displayNumber =
+                displayJid.split("@")[0];
+
               text +=
-                `${index + 1}. @${jid.split("@")[0]}
+                `${index + 1}. @${displayNumber}
    🔒 ${(info.mode || "bann").toUpperCase()}
 
 `;
+
+              if (
+                displayJid.endsWith("@s.whatsapp.net")
+              ) {
+                listMentionJids.push(displayJid);
+              }
             }
           );
 
@@ -7135,10 +8025,7 @@ if (command === "kick") {
 
           await sock.sendMessage(groupId, {
             text,
-            mentions:
-              entries.map(
-                ([jid]) => jid
-              )
+            mentions: listMentionJids
           });
 
           return;
