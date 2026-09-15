@@ -18,6 +18,74 @@ const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_KEY
 );
+
+// ============================================
+// 🤖 GEMINI AI CHATBOT
+// ============================================
+const { GoogleGenAI } = require("@google/genai");
+
+const gemini = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY
+});
+
+const GEMINI_MODEL = "gemini-3.6-flash";
+
+const SILVER_AI_SYSTEM_PROMPT = `
+You are Silver, a playful WhatsApp group chatbot.
+
+PERSONALITY:
+- Talk naturally like a fun member of the group.
+- Be playful, witty, friendly, and occasionally tease people when the context clearly allows it.
+- Use emojis naturally 😂😭💀🔥❤️, but do NOT spam emojis.
+- Understand casual WhatsApp language, slang, abbreviations, and Nigerian-style expressions.
+- Keep normal answers concise and conversational.
+- If someone asks for a serious explanation, become clear and helpful instead of forcing jokes.
+- Match the user's energy.
+- Do not sound like a formal customer-service bot.
+- Do not repeatedly say things like "As an AI..." unless it is genuinely relevant.
+- Never invent facts just to make a joke sound convincing.
+- Do not insult, threaten, harass, or encourage harmful behavior.
+- If someone is clearly joking, you can joke back.
+- If someone is upset or discussing something serious, respond appropriately and respectfully.
+
+CHAT STYLE:
+- Prefer short natural WhatsApp-style replies.
+- Use line breaks when they improve readability.
+- Don't over-explain unless asked.
+- Don't start every response with "Bro", "Yo", or an emoji.
+- Don't force Nigerian slang into every message.
+`;
+
+async function askSilverAI(userMessage, context = "") {
+  try {
+    if (!process.env.GEMINI_API_KEY) {
+      console.error("❌ GEMINI_API_KEY is missing.");
+      return null;
+    }
+
+    const prompt = `${SILVER_AI_SYSTEM_PROMPT}
+
+${context ? `RECENT CONTEXT:\n${context}\n\n` : ""}USER MESSAGE:
+${userMessage}`;
+
+    const response = await gemini.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: prompt
+    });
+
+    const reply = response?.text?.trim();
+
+    if (!reply) {
+      console.error("❌ Gemini returned an empty response.");
+      return null;
+    }
+
+    return reply;
+  } catch (error) {
+    console.error("❌ Silver AI error:", error?.message || error);
+    return null;
+  }
+}
 const path = require("path");
 const sharp = require("sharp");
 const youtubedl = require('youtube-dl-exec');
@@ -39,6 +107,221 @@ const adminSettings = {};
 const stickerCommands = {};
 const lockedGroups = new Set();
 const userWarns = {};
+
+// ============================================
+// 🧠 CHATBOT — 24-HOUR GROUP CHAT MEMORY
+// ============================================
+
+const CHAT_MEMORY_MAX_HOURS = 24;
+const CHAT_MEMORY_MAX_MESSAGE_LENGTH = 1200;
+
+const CHATBOT_COOLDOWN_MS = 10 * 1000;
+const CHATBOT_HOURLY_LIMIT = 30;
+
+const chatbotLastResponse = new Map();
+const chatbotHourlyUsage = new Map();
+
+// Check whether the group is allowed to use Gemini.
+const canUseChatbot = (groupJid) => {
+  const now = Date.now();
+
+  const lastResponse =
+    chatbotLastResponse.get(groupJid) || 0;
+
+  if (now - lastResponse < CHATBOT_COOLDOWN_MS) {
+    return false;
+  }
+
+  let usage =
+    chatbotHourlyUsage.get(groupJid);
+
+  if (!usage || now - usage.startedAt >= 60 * 60 * 1000) {
+    usage = {
+      startedAt: now,
+      count: 0
+    };
+
+    chatbotHourlyUsage.set(groupJid, usage);
+  }
+
+  if (usage.count >= CHATBOT_HOURLY_LIMIT) {
+    return false;
+  }
+
+  return true;
+};
+
+// Record a successful Gemini response.
+const recordChatbotUsage = (groupJid) => {
+  const now = Date.now();
+
+  chatbotLastResponse.set(groupJid, now);
+
+  let usage =
+    chatbotHourlyUsage.get(groupJid);
+
+  if (!usage || now - usage.startedAt >= 60 * 60 * 1000) {
+    usage = {
+      startedAt: now,
+      count: 0
+    };
+  }
+
+  usage.count += 1;
+  chatbotHourlyUsage.set(groupJid, usage);
+};
+
+// Periodically remove inactive rate-limit entries.
+setInterval(() => {
+  const now = Date.now();
+  const expiry = 60 * 60 * 1000;
+
+  for (const [groupJid, timestamp] of chatbotLastResponse) {
+    if (now - timestamp >= expiry) {
+      chatbotLastResponse.delete(groupJid);
+    }
+  }
+
+  for (const [groupJid, usage] of chatbotHourlyUsage) {
+    if (!usage || now - usage.startedAt >= expiry) {
+      chatbotHourlyUsage.delete(groupJid);
+    }
+  }
+}, 30 * 60 * 1000);
+
+// Save a normal group message for chatbot context.
+const saveChatMessageToSupabase = async (
+  groupJid,
+  userJid,
+  userName,
+  messageText
+) => {
+  try {
+    if (
+      !groupJid ||
+      !userJid ||
+      !messageText ||
+      typeof messageText !== "string"
+    ) {
+      return;
+    }
+
+    const cleanedText =
+      messageText.trim().slice(0, CHAT_MEMORY_MAX_MESSAGE_LENGTH);
+
+    if (!cleanedText) return;
+
+    // Don't save bot commands as normal chat context.
+    if (cleanedText.startsWith(PREFIX)) return;
+
+    const { error } = await supabase
+      .from("bot_chat_messages")
+      .insert({
+        group_jid: groupJid,
+        user_jid: userJid,
+        user_name: userName || "Unknown",
+        message_text: cleanedText
+      });
+
+    if (error) throw error;
+
+  } catch (error) {
+    logger.error(
+      { error: error.message },
+      "Failed to save chatbot chat memory"
+    );
+  }
+};
+
+// Limit conversation text sent to Gemini.
+// Full history remains safely stored in Supabase.
+const limitGeminiContext = (conversationText, maxChars = 24000) => {
+  if (!conversationText || typeof conversationText !== "string") {
+    return "";
+  }
+
+  if (conversationText.length <= maxChars) {
+    return conversationText;
+  }
+
+  return "[Earlier messages omitted for context limit]\n\n" +
+    conversationText.slice(-maxChars);
+};
+
+// Get recent messages for AI context.
+const getRecentChatMessages = async (
+  groupJid,
+  hours = CHAT_MEMORY_MAX_HOURS,
+  limit = 80
+) => {
+  try {
+    const safeHours = Math.min(
+      Math.max(Number(hours) || CHAT_MEMORY_MAX_HOURS, 1),
+      CHAT_MEMORY_MAX_HOURS
+    );
+
+    const since =
+      new Date(
+        Date.now() - safeHours * 60 * 60 * 1000
+      ).toISOString();
+
+    const { data, error } = await supabase
+      .from("bot_chat_messages")
+      .select(
+        "user_jid, user_name, message_text, created_at"
+      )
+      .eq("group_jid", groupJid)
+      .gte("created_at", since)
+      .order("created_at", { ascending: true })
+      .limit(limit);
+
+    if (error) throw error;
+
+    return data || [];
+
+  } catch (error) {
+    logger.error(
+      { error: error.message },
+      "Failed to load chatbot chat memory"
+    );
+
+    return [];
+  }
+};
+
+// Delete expired messages so chat memory stays at 24 hours.
+const cleanupExpiredChatMessages = async () => {
+  try {
+    const expiry =
+      new Date(
+        Date.now() -
+        CHAT_MEMORY_MAX_HOURS * 60 * 60 * 1000
+      ).toISOString();
+
+    const { error } = await supabase
+      .from("bot_chat_messages")
+      .delete()
+      .lt("created_at", expiry);
+
+    if (error) throw error;
+
+    logger.debug(
+      "Expired chatbot chat memory cleaned up"
+    );
+
+  } catch (error) {
+    logger.error(
+      { error: error.message },
+      "Failed to clean expired chatbot chat memory"
+    );
+  }
+};
+
+// Run cleanup once every hour.
+setInterval(
+  cleanupExpiredChatMessages,
+  60 * 60 * 1000
+);
 
 // ============================================
 // 🚫 BAN SYSTEM
@@ -122,6 +405,7 @@ const expCooldowns = new Map();
 
 // EXP comeback feature
 const expComebackEnabled = {};
+const chatbotEnabled = {}; // { groupJid: true/false }
 const expLastMessage = {};
 
 // EXP settings
@@ -565,7 +849,10 @@ const saveGroupSettingsToSupabase = async (groupJid) => {
       activityTracking: activityTracking[groupJid] ?? false,
       expEnabled: expEnabled[groupJid] ?? false,
       expComebackEnabled:
-        expComebackEnabled[groupJid] ?? false
+        expComebackEnabled[groupJid] ?? false,
+
+      chatbotEnabled:
+        chatbotEnabled[groupJid] ?? false
     };
 
     const { error } = await supabase
@@ -667,6 +954,9 @@ const loadGroupSettingsFromSupabase = async () => {
 
       expComebackEnabled[groupId] =
         Boolean(settings.expComebackEnabled);
+
+      chatbotEnabled[groupId] =
+        Boolean(settings.chatbotEnabled);
 
       if (settings.nightMode && !nightModeGroups.includes(groupId)) {
         nightModeGroups.push(groupId);
@@ -3864,6 +4154,30 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         return;
       }
 
+      
+      // ============================================
+      // 🧠 CHATBOT — SAVE GROUP CHAT MEMORY
+      // ============================================
+      // Store normal group conversation for the
+      // 24-hour chatbot memory system.
+      //
+      // Commands are ignored by the helper.
+      // Bot's own messages are also ignored.
+
+      if (
+        isGroup &&
+        !message.key.fromMe &&
+        text?.trim()
+      ) {
+        saveChatMessageToSupabase(
+          message.key.remoteJid,
+          sender,
+          message.pushName || "Unknown",
+          text
+        );
+      }
+
+
       // ============================================
       // AFK System - Check & Handle
       // ============================================
@@ -3994,6 +4308,93 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
   ? fullCommand.slice(PREFIX.length)
   : (fullCommand || "");
       const args = text?.trim().split(" ").slice(1) || [];
+
+      
+      // ============================================
+      // 🤖 SILVER AI CHATBOT TRIGGER
+      // ============================================
+      // Only runs in groups where .chatbot is ON.
+      // Silver responds to:
+      // 1. Direct mentions of the bot
+      // 2. Replies to the bot's messages
+      // Normal group messages do NOT trigger AI.
+
+      if (
+        isGroup &&
+        chatbotEnabled[message.key.remoteJid] === true &&
+        !message.key.fromMe &&
+        !fullCommand?.startsWith(PREFIX)
+      ) {
+        const chatbotContextInfo =
+          message.message?.extendedTextMessage?.contextInfo ||
+          message.message?.imageMessage?.contextInfo ||
+          message.message?.videoMessage?.contextInfo ||
+          {};
+
+        const botJid = myJid;
+        const normalizedBotJid = normalizeJid(botJid);
+
+        const mentionedJidsForAI =
+          chatbotContextInfo?.mentionedJid || [];
+
+        const mentionedBot =
+          mentionedJidsForAI.some(
+            jid => normalizeJid(jid) === normalizedBotJid
+          );
+
+        const quotedParticipant =
+          chatbotContextInfo?.participant || "";
+
+        const repliedToBot =
+          Boolean(quotedParticipant) &&
+          normalizeJid(quotedParticipant) === normalizedBotJid;
+
+        if (mentionedBot || repliedToBot) {
+          // Protect the Gemini API from spam.
+          const chatbotGroupJid =
+            message.key.remoteJid;
+
+          if (!canUseChatbot(chatbotGroupJid)) {
+            return;
+          }
+
+          // Load recent group conversation so Silver
+          // understands what people were talking about.
+          const recentChat =
+            await getRecentChatMessages(
+              message.key.remoteJid,
+              24,
+              60
+            );
+
+          const recentContext = recentChat
+            .map(msg => {
+              const name = msg.user_name || "Unknown";
+              const content = msg.message_text || "";
+              return `${name}: ${content}`;
+            })
+            .join("\n");
+
+          const limitedRecentContext =
+            limitGeminiContext(recentContext);
+
+          const aiReply = await askSilverAI(
+            text || "Say something playful.",
+            limitedRecentContext
+          );
+
+          if (aiReply) {
+            recordChatbotUsage(chatbotGroupJid);
+
+            await sock.sendMessage(message.key.remoteJid, {
+              text: aiReply
+            });
+          }
+
+          return;
+        }
+      }
+
 
       // ============================================
       // 🔒 IGNORE UNAUTHORIZED DM COMMANDS
@@ -8480,6 +8881,163 @@ if (command === "kick") {
             });
           }
           logger.info({ group: message.key.remoteJid, mode: action }, 'Antilink toggled');
+          return;
+        }
+
+        // ============================================
+        // 📝 CHAT SUMMARY COMMAND
+        // ============================================
+        if (command === "summary") {
+          if (!isGroup) {
+            return;
+          }
+
+          const requestedHours = args[0]
+            ? Number.parseInt(args[0], 10)
+            : 24;
+
+          if (
+            Number.isNaN(requestedHours) ||
+            ![6, 12, 24].includes(requestedHours)
+          ) {
+            await sock.sendMessage(message.key.remoteJid, {
+              text:
+                "📝 *Chat Summary*\n\n" +
+                "*Usage:*\n" +
+                "• .summary — Last 24 hours\n" +
+                "• .summary 6h — Last 6 hours\n" +
+                "• .summary 12h — Last 12 hours\n" +
+                "• .summary 24h — Last 24 hours"
+            });
+            return;
+          }
+
+          const groupJid = message.key.remoteJid;
+
+          const recentMessages =
+            await getRecentChatMessages(
+              groupJid,
+              requestedHours,
+              100
+            );
+
+          if (!recentMessages.length) {
+            await sock.sendMessage(groupJid, {
+              text:
+                `📝 *Chat Summary — ${requestedHours}h*\n\n` +
+                "No recent conversation found."
+            });
+            return;
+          }
+
+          const conversationText = recentMessages
+            .map(msg => {
+              const name = msg.user_name || "Unknown";
+              const content = msg.message_text || "";
+              return `${name}: ${content}`;
+            })
+            .join("\n");
+
+          const limitedSummaryContext =
+            limitGeminiContext(conversationText);
+
+          const summaryPrompt = `
+Summarize this WhatsApp group conversation from the last ${requestedHours} hours.
+
+Keep the summary concise and natural.
+
+Include:
+- Main topics discussed
+- Important events or announcements
+- Funny or notable moments if relevant
+- Decisions or plans people made
+- Unresolved questions or arguments if relevant
+
+Do not invent information.
+Do not mention that you are an AI.
+Use a friendly WhatsApp-style tone.
+
+CONVERSATION:
+${limitedSummaryContext}
+`;
+
+          const summary = await askSilverAI(
+            summaryPrompt,
+            ""
+          );
+
+          if (!summary) {
+            await sock.sendMessage(groupJid, {
+              text:
+                "❌ I couldn't generate the summary right now. Try again shortly."
+            });
+            return;
+          }
+
+          await sock.sendMessage(groupJid, {
+            text:
+              `📝 *Chat Summary — Last ${requestedHours}h*\n\n` +
+              summary
+          });
+
+          return;
+        }
+
+        // ============================================
+        // 🤖 Chatbot Command
+        // ============================================
+        if (command === "chatbot") {
+          if (!isAdmin && !canUseAsOwner) {
+            await sock.sendMessage(message.key.remoteJid, {
+              text: "❌ Admins only."
+            });
+            return;
+          }
+
+          const action = args[0]?.toLowerCase();
+          const groupJid = message.key.remoteJid;
+          const enabled = Boolean(chatbotEnabled[groupJid]);
+
+          if (!action || !["on", "off", "status"].includes(action)) {
+            await sock.sendMessage(groupJid, {
+              text:
+                "🤖 *Silver Chatbot*\\n\\n" +
+                `Status: *${enabled ? "ON 🟢" : "OFF 🔴"}*\\n\\n` +
+                "*Usage:*\\n" +
+                "• .chatbot on — Enable chatbot\\n" +
+                "• .chatbot off — Disable chatbot\\n" +
+                "• .chatbot status — Check status"
+            });
+            return;
+          }
+
+          if (action === "status") {
+            await sock.sendMessage(groupJid, {
+              text: `🤖 *Silver Chatbot*\\n\\nStatus: *${enabled ? "ON 🟢" : "OFF 🔴"}*`
+            });
+            return;
+          }
+
+          if (action === "on") {
+            chatbotEnabled[groupJid] = true;
+          } else {
+            chatbotEnabled[groupJid] = false;
+          }
+
+          await savePersistentGroupSettings(groupJid);
+
+          await sock.sendMessage(groupJid, {
+            text:
+              action === "on"
+                ? "🤖 *Silver Chatbot enabled!* 🟢\\n\\nMention me or reply to one of my messages and I'll respond 😂"
+                : "🤖 *Silver Chatbot disabled.* 🔴"
+          });
+
+          logger.info(
+            { group: groupJid, action },
+            "Chatbot toggled"
+          );
+
           return;
         }
 

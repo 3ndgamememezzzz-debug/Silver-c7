@@ -16,6 +16,7 @@
   "license": "MIT",
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",
+    "@google/genai": "^2.22.0",
     "@supabase/supabase-js": "^2.112.3",
     "@whiskeysockets/baileys": "^7.0.0-rc13",
     "axios": "^1.6.2",
