@@ -4331,23 +4331,37 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           message.message?.videoMessage?.contextInfo ||
           {};
 
-        const botJid = myJid;
-        const normalizedBotJid = normalizeJid(botJid);
+        // WhatsApp can identify the bot using either its
+        // normal JID or its newer LID identity.
+        const botIdentityJids = [
+          sock.user?.id,
+          sock.user?.lid,
+          myJid
+        ].filter(Boolean);
+
+        const isBotIdentity = (jid) => {
+          if (!jid) return false;
+
+          return botIdentityJids.some(botIdentity => {
+            return (
+              jid === botIdentity ||
+              normalizeJid(jid) === normalizeJid(botIdentity)
+            );
+          });
+        };
 
         const mentionedJidsForAI =
           chatbotContextInfo?.mentionedJid || [];
 
         const mentionedBot =
-          mentionedJidsForAI.some(
-            jid => normalizeJid(jid) === normalizedBotJid
-          );
+          mentionedJidsForAI.some(isBotIdentity);
 
         const quotedParticipant =
           chatbotContextInfo?.participant || "";
 
         const repliedToBot =
           Boolean(quotedParticipant) &&
-          normalizeJid(quotedParticipant) === normalizedBotJid;
+          isBotIdentity(quotedParticipant);
 
         if (mentionedBot || repliedToBot) {
           // Protect the Gemini API from spam.
