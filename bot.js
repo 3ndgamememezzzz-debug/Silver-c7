@@ -7434,6 +7434,49 @@ if (command === "kick") {
             return;
           }
 
+          // Resolve the target to WhatsApp's actual participant JID.
+          // This avoids storing a LID and later generating broken numbers.
+          let actualTargetJid = targetJid;
+          let targetDisplayName = null;
+
+          try {
+            const metadata = await sock.groupMetadata(groupId);
+            const participants = metadata.participants || [];
+
+            const participant = participants.find((p) => {
+              if (!p?.id) return false;
+
+              if (p.id === targetJid) return true;
+              if (p.lid && p.lid === targetJid) return true;
+              if (p.phoneNumber && p.phoneNumber === targetJid) return true;
+
+              return (
+                normalizeJid(p.id) === normalizeJid(targetJid)
+              );
+            });
+
+            if (participant) {
+              actualTargetJid =
+                participant.id ||
+                participant.phoneNumber ||
+                targetJid;
+
+              targetDisplayName =
+                participant.notify ||
+                participant.name ||
+                participant.displayName ||
+                null;
+            }
+          } catch (err) {
+            logger.warn(
+              {
+                targetJid,
+                error: err.message
+              },
+              "Could not resolve ban target participant"
+            );
+          }
+
           if (!bannedUsers[groupId]) {
             bannedUsers[groupId] = {};
           }
@@ -7443,14 +7486,22 @@ if (command === "kick") {
               ? "bann"
               : "bann2";
 
-          bannedUsers[groupId][targetJid] = {
+          bannedUsers[groupId][actualTargetJid] = {
             mode,
             bannedAt:
               new Date().toISOString(),
             bannedBy:
               message.key.participant ||
-              message.key.remoteJid
+              message.key.remoteJid,
+            displayJid:
+              actualTargetJid.endsWith("@s.whatsapp.net")
+                ? actualTargetJid
+                : null,
+            displayName:
+              targetDisplayName
           };
+
+          targetJid = actualTargetJid;
 
           // Save locally + Supabase
           saveData();
@@ -8023,8 +8074,12 @@ if (command === "kick") {
               const displayNumber =
                 displayJid.split("@")[0];
 
+              const displayName =
+                info?.displayName ||
+                null;
+
               text +=
-                `${index + 1}. @${displayNumber}
+                `${index + 1}. ${displayName ? displayName + " " : ""}@${displayNumber}
    🔒 ${(info.mode || "bann").toUpperCase()}
 
 `;
