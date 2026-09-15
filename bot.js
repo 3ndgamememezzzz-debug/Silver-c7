@@ -4331,63 +4331,122 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           message.message?.videoMessage?.contextInfo ||
           {};
 
-        // WhatsApp can identify the bot using either its
-        // normal JID or its newer LID identity.
-        const botIdentityJids = [
-          sock.user?.id,
-          sock.user?.lid,
-          myJid
-        ].filter(Boolean);
+        const chatbotGroupJid =
+          message.key.remoteJid;
 
-        const isBotIdentity = (jid) => {
-          if (!jid) return false;
+        // Resolve Silver through the actual group participant list.
+        // WhatsApp may give mentions/replies as a normal JID,
+        // LID, or phoneNumber, so compare against all identities.
+        let mentionedBot = false;
+        let repliedToBot = false;
 
-          return botIdentityJids.some(botIdentity => {
-            return (
-              jid === botIdentity ||
-              normalizeJid(jid) === normalizeJid(botIdentity)
-            );
-          });
-        };
+        try {
+          const [metadata, recentChat] =
+            await Promise.all([
+              sock.groupMetadata(chatbotGroupJid),
+              getRecentChatMessages(
+                chatbotGroupJid,
+                24,
+                60
+              )
+            ]);
 
-        const mentionedJidsForAI =
-          chatbotContextInfo?.mentionedJid || [];
+          const participants =
+            metadata?.participants || [];
 
-        const mentionedBot =
-          mentionedJidsForAI.some(isBotIdentity);
+          const botParticipant =
+            participants.find((participant) => {
+              if (!participant?.id) return false;
 
-        const quotedParticipant =
-          chatbotContextInfo?.participant || "";
+              if (
+                participant.id === sock.user?.id ||
+                participant.id === myJid
+              ) {
+                return true;
+              }
 
-        const repliedToBot =
-          Boolean(quotedParticipant) &&
-          isBotIdentity(quotedParticipant);
+              if (
+                participant.lid &&
+                participant.lid === sock.user?.lid
+              ) {
+                return true;
+              }
 
-        if (mentionedBot || repliedToBot) {
+              if (
+                sock.user?.lid &&
+                participant.lid === sock.user.lid
+              ) {
+                return true;
+              }
+
+              return (
+                normalizeJid(participant.id) ===
+                normalizeJid(sock.user?.id)
+              );
+            });
+
+          if (botParticipant) {
+            const botIds = [
+              botParticipant.id,
+              botParticipant.lid,
+              botParticipant.phoneNumber,
+              sock.user?.id,
+              sock.user?.lid
+            ].filter(Boolean);
+
+            const matchesBot = (jid) => {
+              if (!jid) return false;
+
+              return botIds.some((botId) => {
+                return (
+                  jid === botId ||
+                  normalizeJid(jid) === normalizeJid(botId)
+                );
+              });
+            };
+
+            const mentionedJidsForAI =
+              chatbotContextInfo?.mentionedJid || [];
+
+            mentionedBot =
+              mentionedJidsForAI.some(matchesBot);
+
+            const quotedParticipant =
+              chatbotContextInfo?.participant || "";
+
+            repliedToBot =
+              Boolean(quotedParticipant) &&
+              matchesBot(quotedParticipant);
+          }
+
+          if (!mentionedBot && !repliedToBot) {
+            return;
+          }
+
           // Protect the Gemini API from spam.
-          const chatbotGroupJid =
-            message.key.remoteJid;
-
           if (!canUseChatbot(chatbotGroupJid)) {
             return;
           }
 
-          // Load recent group conversation so Silver
-          // understands what people were talking about.
-          const recentChat =
-            await getRecentChatMessages(
-              message.key.remoteJid,
-              24,
-              60
+          // Show WhatsApp typing status while Gemini is thinking.
+          try {
+            await sock.sendPresenceUpdate(
+              "composing",
+              chatbotGroupJid
             );
+          } catch (_) {}
 
-          const recentContext = recentChat
-            .map(msg => {
-              const name = msg.user_name || "Unknown";
-              const content = msg.message_text || "";
-              return `${name}: ${content}`;
-            })
-            .join("\n");
+          const recentContext =
+            recentChat
+              .map(msg => {
+                const name =
+                  msg.user_name || "Unknown";
+                const content =
+                  msg.message_text || "";
+
+                return `${name}: ${content}`;
+              })
+              .join("\n");
 
           const limitedRecentContext =
             limitGeminiContext(recentContext);
@@ -4400,10 +4459,31 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           if (aiReply) {
             recordChatbotUsage(chatbotGroupJid);
 
-            await sock.sendMessage(message.key.remoteJid, {
-              text: aiReply
-            });
+            await sock.sendMessage(
+              chatbotGroupJid,
+              {
+                text: aiReply
+              }
+            );
           }
+
+          try {
+            await sock.sendPresenceUpdate(
+              "paused",
+              chatbotGroupJid
+            );
+          } catch (_) {}
+
+          return;
+
+        } catch (error) {
+          logger.error(
+            {
+              group: chatbotGroupJid,
+              error: error?.message || error
+            },
+            "Silver chatbot trigger failed"
+          );
 
           return;
         }
@@ -8947,7 +9027,11 @@ if (command === "kick") {
           const conversationText = recentMessages
             .map(msg => {
               const name = msg.user_name || "Unknown";
-              const content = msg.message_text || "";
+
+              const content =
+                (msg.message_text || "")
+                  .replace(/@\d{6,}/g, "@someone");
+
               return `${name}: ${content}`;
             })
             .join("\n");
@@ -8970,6 +9054,9 @@ Include:
 Do not invent information.
 Do not mention that you are an AI.
 Use a friendly WhatsApp-style tone.
+Never expose raw WhatsApp JIDs, LIDs, phone-number identifiers,
+or strings such as @123456789 in the summary.
+If a person's identity is unclear, say "someone" instead.
 
 CONVERSATION:
 ${limitedSummaryContext}
@@ -9015,11 +9102,11 @@ ${limitedSummaryContext}
           if (!action || !["on", "off", "status"].includes(action)) {
             await sock.sendMessage(groupJid, {
               text:
-                "🤖 *Silver Chatbot*\\n\\n" +
+                "🤖 *Silver Chatbot*\n\n" +
                 `Status: *${enabled ? "ON 🟢" : "OFF 🔴"}*\\n\\n` +
-                "*Usage:*\\n" +
-                "• .chatbot on — Enable chatbot\\n" +
-                "• .chatbot off — Disable chatbot\\n" +
+                "*Usage:*\n" +
+                "• .chatbot on — Enable chatbot\n" +
+                "• .chatbot off — Disable chatbot\n" +
                 "• .chatbot status — Check status"
             });
             return;
@@ -9043,7 +9130,7 @@ ${limitedSummaryContext}
           await sock.sendMessage(groupJid, {
             text:
               action === "on"
-                ? "🤖 *Silver Chatbot enabled!* 🟢\\n\\nMention me or reply to one of my messages and I'll respond 😂"
+                ? "🤖 *Silver Chatbot enabled!* 🟢\n\nMention me or reply to one of my messages and I'll respond 😂"
                 : "🤖 *Silver Chatbot disabled.* 🔴"
           });
 
