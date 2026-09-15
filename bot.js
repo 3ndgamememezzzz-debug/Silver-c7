@@ -2825,12 +2825,12 @@ Ready to manage!`,
             await sock.sendMessage(groupJid, {
               text:
                 "╭━━━〔 🚫 COUNTRY BANNED 〕━━━╮\n\n" +
-                `👤 @${phoneNumber}\n` +
+                `👤 @${participantJid.split("@")[0]}\n` +
                 `🌍 Country code: +${matchedCode}\n` +
                 "❌ This country code is banned from this group.\n" +
                 "👢 Removing automatically...\n\n" +
                 "╰━━━━━━━━━━━━━━━━━━━━━━━━╯",
-              mentions: [phoneJid]
+              mentions: [participantJid]
             });
 
             await sock.groupParticipantsUpdate(
@@ -8018,6 +8018,7 @@ if (command === "kick") {
         }
 
         // ==================================================
+        // ==================================================
         // 📋 .LIST BANNED
         // ==================================================
 
@@ -8026,74 +8027,105 @@ if (command === "kick") {
           args[0]?.toLowerCase() === "banned"
         ) {
 
-          const groupId =
-            message.key.remoteJid;
+          const groupId = message.key.remoteJid;
 
           if (!isGroup) {
             await sock.sendMessage(groupId, {
-              text:
-                "❌ This command only works in groups."
+              text: "❌ This command only works in groups."
             });
             return;
           }
 
-          const groupBans =
-            bannedUsers[groupId] || {};
-
-          const entries =
-            Object.entries(groupBans);
+          const groupBans = bannedUsers[groupId] || {};
+          const entries = Object.entries(groupBans);
 
           if (entries.length === 0) {
-
             await sock.sendMessage(groupId, {
               text:
-                `╭━━━〔 🚫 BANNED USERS 〕━━━╮
-
-📭 No banned users in this group.
-
-╰━━━━━━━━━━━━━━━━━━━━━━━━╯`
+                `╭━━━〔 🚫 BANNED USERS 〕━━━╮\n\n` +
+                `📭 No banned users in this group.\n` +
+                `╰━━━━━━━━━━━━━━━━━━━━━━━━╯`
             });
-
             return;
           }
 
-          let text =
-            `╭━━━〔 🚫 BANNED USERS 〕━━━╮
+          // Load current group participants so old LIDs can be
+          // resolved back to their real WhatsApp identity.
+          let groupMeta = null;
 
-`;
+          try {
+            groupMeta = await sock.groupMetadata(groupId);
+          } catch (err) {
+            logger.warn(
+              { error: err.message },
+              "Could not load group metadata for banned list"
+            );
+          }
 
+          const participants = groupMeta?.participants || [];
           const listMentionJids = [];
 
-          entries.forEach(
-            ([jid, info], index) => {
+          let text =
+            `╭━━━〔 🚫 BANNED USERS 〕━━━╮\n\n`;
 
-              const displayJid =
-                info?.displayJid ||
-                jid;
+          entries.forEach(([jid, info], index) => {
 
-              const displayNumber =
-                displayJid.split("@")[0];
+            // Try to find the stored LID/JID inside current
+            // group participant metadata.
+            const participant = participants.find((p) => {
+              if (!p) return false;
 
-              const displayName =
-                info?.displayName ||
-                null;
+              const id = p.id || null;
+              const lid = p.lid || null;
+              const phone = p.phoneNumber || null;
 
-              text +=
-                `${index + 1}. ${displayName ? displayName + " " : ""}@${displayNumber}
-   🔒 ${(info.mode || "bann").toUpperCase()}
+              return (
+                id === jid ||
+                lid === jid ||
+                phone === jid ||
+                (id && normalizeJid(id) === normalizeJid(jid))
+              );
+            });
 
-`;
+            // Prefer the actual participant JID.
+            const mentionJid =
+              participant?.id ||
+              participant?.phoneNumber ||
+              info?.displayJid ||
+              null;
 
-              if (
-                displayJid.endsWith("@s.whatsapp.net")
-              ) {
-                listMentionJids.push(displayJid);
-              }
+            // Prefer the actual WhatsApp display name.
+            const displayName =
+              participant?.notify ||
+              participant?.name ||
+              participant?.displayName ||
+              info?.displayName ||
+              null;
+
+            // If we can't resolve the old LID, don't turn it
+            // into a fake phone number. Show a safe fallback.
+            const mentionTag =
+              mentionJid
+                ? `@${mentionJid.split("@")[0]}`
+                : (displayName ? displayName : "Unknown user");
+
+            text +=
+              `${index + 1}. ` +
+              `${displayName ? `*${displayName}* ` : ""}` +
+              `${mentionJid ? mentionTag : ""}\n` +
+              `   🔒 ${(info?.mode || "bann").toUpperCase()}\n\n`;
+
+            if (
+              mentionJid &&
+              typeof mentionJid === "string" &&
+              mentionJid.includes("@")
+            ) {
+              listMentionJids.push(mentionJid);
             }
-          );
+          });
 
           text +=
-            "╰━━━━━━━━━━━━━━━━━━━━━━━━╯";
+            `╰━━━━━━━━━━━━━━━━━━━━━━━━╯`;
 
           await sock.sendMessage(groupId, {
             text,
@@ -8102,7 +8134,6 @@ if (command === "kick") {
 
           return;
         }
-
 
         // ==================================================
         // ♻️ .RESET BANNED
