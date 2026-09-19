@@ -4334,12 +4334,6 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         const chatbotGroupJid =
           message.key.remoteJid;
 
-        // Resolve Silver through the actual group participant list.
-        // WhatsApp may give mentions/replies as a normal JID,
-        // LID, or phoneNumber, so compare against all identities.
-        let mentionedBot = false;
-        let repliedToBot = false;
-
         try {
           const [metadata, recentChat] =
             await Promise.all([
@@ -4354,69 +4348,106 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           const participants =
             metadata?.participants || [];
 
+          const sameParticipant = (a, b) => {
+            if (!a || !b) return false;
+
+            const aIds = [
+              a.id,
+              a.lid,
+              a.phoneNumber
+            ].filter(Boolean);
+
+            const bIds = [
+              b.id,
+              b.lid,
+              b.phoneNumber
+            ].filter(Boolean);
+
+            return aIds.some(aId =>
+              bIds.some(bId =>
+                aId === bId ||
+                normalizeJid(aId) === normalizeJid(bId)
+              )
+            );
+          };
+
+          const resolveParticipant = (jid) => {
+            if (!jid) return null;
+
+            return participants.find((participant) => {
+              if (!participant?.id) return false;
+
+              const ids = [
+                participant.id,
+                participant.lid,
+                participant.phoneNumber
+              ].filter(Boolean);
+
+              return ids.some(id =>
+                id === jid ||
+                normalizeJid(id) === normalizeJid(jid)
+              );
+            }) || null;
+          };
+
           const botParticipant =
             participants.find((participant) => {
               if (!participant?.id) return false;
 
-              if (
-                participant.id === sock.user?.id ||
-                participant.id === myJid
-              ) {
-                return true;
-              }
+              const botIds = [
+                sock.user?.id,
+                sock.user?.lid,
+                myJid
+              ].filter(Boolean);
 
-              if (
-                participant.lid &&
-                participant.lid === sock.user?.lid
-              ) {
-                return true;
-              }
+              const participantIds = [
+                participant.id,
+                participant.lid,
+                participant.phoneNumber
+              ].filter(Boolean);
 
-              if (
-                sock.user?.lid &&
-                participant.lid === sock.user.lid
-              ) {
-                return true;
-              }
-
-              return (
-                normalizeJid(participant.id) ===
-                normalizeJid(sock.user?.id)
+              return participantIds.some(participantId =>
+                botIds.some(botId =>
+                  participantId === botId ||
+                  normalizeJid(participantId) === normalizeJid(botId)
+                )
               );
-            });
+            }) || null;
+
+          let mentionedBot = false;
+          let repliedToBot = false;
 
           if (botParticipant) {
-            const botIds = [
-              botParticipant.id,
-              botParticipant.lid,
-              botParticipant.phoneNumber,
-              sock.user?.id,
-              sock.user?.lid
-            ].filter(Boolean);
-
-            const matchesBot = (jid) => {
-              if (!jid) return false;
-
-              return botIds.some((botId) => {
-                return (
-                  jid === botId ||
-                  normalizeJid(jid) === normalizeJid(botId)
-                );
-              });
-            };
-
-            const mentionedJidsForAI =
+            const mentionedJids =
               chatbotContextInfo?.mentionedJid || [];
 
-            mentionedBot =
-              mentionedJidsForAI.some(matchesBot);
+            mentionedBot = mentionedJids.some((mentionedJid) => {
+              const targetParticipant =
+                resolveParticipant(mentionedJid);
+
+              return (
+                targetParticipant &&
+                sameParticipant(
+                  targetParticipant,
+                  botParticipant
+                )
+              );
+            });
 
             const quotedParticipant =
               chatbotContextInfo?.participant || "";
 
-            repliedToBot =
-              Boolean(quotedParticipant) &&
-              matchesBot(quotedParticipant);
+            if (quotedParticipant) {
+              const repliedParticipant =
+                resolveParticipant(quotedParticipant);
+
+              repliedToBot =
+                Boolean(repliedParticipant) &&
+                sameParticipant(
+                  repliedParticipant,
+                  botParticipant
+                );
+            }
           }
 
           if (!mentionedBot && !repliedToBot) {
@@ -4441,6 +4472,7 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
               .map(msg => {
                 const name =
                   msg.user_name || "Unknown";
+
                 const content =
                   msg.message_text || "";
 
@@ -9008,38 +9040,174 @@ if (command === "kick") {
 
           const groupJid = message.key.remoteJid;
 
-          const recentMessages =
-            await getRecentChatMessages(
-              groupJid,
-              requestedHours,
-              100
-            );
+          try {
+            const [recentMessages, metadata] =
+              await Promise.all([
+                getRecentChatMessages(
+                  groupJid,
+                  requestedHours,
+                  100
+                ),
+                sock.groupMetadata(groupJid)
+              ]);
 
-          if (!recentMessages.length) {
-            await sock.sendMessage(groupJid, {
-              text:
-                `📝 *Chat Summary — ${requestedHours}h*\n\n` +
-                "No recent conversation found."
-            });
-            return;
-          }
+            if (!recentMessages.length) {
+              await sock.sendMessage(groupJid, {
+                text:
+                  `📝 *Chat Summary — ${requestedHours}h*\n\n` +
+                  "No recent conversation found."
+              });
+              return;
+            }
 
-          const conversationText = recentMessages
-            .map(msg => {
-              const name = msg.user_name || "Unknown";
+            const participants =
+              metadata?.participants || [];
 
-              const content =
-                (msg.message_text || "")
-                  .replace(/@\d{6,}/g, "@someone");
+            const resolveParticipant = (jid) => {
+              if (!jid) return null;
 
-              return `${name}: ${content}`;
-            })
-            .join("\n");
+              return participants.find((participant) => {
+                if (!participant?.id) return false;
 
-          const limitedSummaryContext =
-            limitGeminiContext(conversationText);
+                const ids = [
+                  participant.id,
+                  participant.lid,
+                  participant.phoneNumber
+                ].filter(Boolean);
 
-          const summaryPrompt = `
+                return ids.some(id =>
+                  id === jid ||
+                  normalizeJid(id) === normalizeJid(jid)
+                );
+              }) || null;
+            };
+
+            const getParticipantName = (participant) => {
+              if (!participant) return "someone";
+
+              return (
+                participant.notify ||
+                participant.name ||
+                participant.verifiedName ||
+                participant.id?.split("@")[0] ||
+                "someone"
+              );
+            };
+
+            const users = new Map();
+            let userCounter = 0;
+
+            const getUserMarker = (
+              jid,
+              preferredName = null
+            ) => {
+              const participant =
+                resolveParticipant(jid);
+
+              const canonicalJid =
+                participant?.id ||
+                jid;
+
+              const key =
+                normalizeJid(canonicalJid);
+
+              if (!key) {
+                return null;
+              }
+
+              if (users.has(key)) {
+                return users.get(key);
+              }
+
+              userCounter += 1;
+
+              const token =
+                `user_${userCounter}`;
+
+              const name =
+                preferredName ||
+                getParticipantName(participant);
+
+              users.set(key, {
+                token,
+                jid: canonicalJid,
+                name:
+                  name ||
+                  "someone"
+              });
+
+              return users.get(key);
+            };
+
+            const conversationText =
+              recentMessages
+                .map(msg => {
+                  const sender =
+                    getUserMarker(
+                      msg.user_jid,
+                      msg.user_name || null
+                    );
+
+                  const senderLabel =
+                    sender
+                      ? `[[USER:${sender.token}]]`
+                      : "someone";
+
+                  let content =
+                    msg.message_text || "";
+
+                  // Resolve raw @123... references to
+                  // internal markers before Gemini sees them.
+                  content =
+                    content.replace(
+                      /@(\d{6,})/g,
+                      (fullMatch, digits) => {
+                        const candidates = [
+                          `${digits}@s.whatsapp.net`,
+                          `${digits}@lid`
+                        ];
+
+                        let participant = null;
+
+                        for (const candidate of candidates) {
+                          participant =
+                            resolveParticipant(candidate);
+
+                          if (participant) break;
+                        }
+
+                        if (!participant) {
+                          return "@someone";
+                        }
+
+                        const mentionedUser =
+                          getUserMarker(
+                            participant.id,
+                            null
+                          );
+
+                        if (!mentionedUser) {
+                          return "@someone";
+                        }
+
+                        return (
+                          `[[MENTION:${mentionedUser.token}]]`
+                        );
+                      }
+                    );
+
+                  return (
+                    `${senderLabel}: ${content}`
+                  );
+                })
+                .join("\n");
+
+            const limitedSummaryContext =
+              limitGeminiContext(
+                conversationText
+              );
+
+            const summaryPrompt = `
 Summarize this WhatsApp group conversation from the last ${requestedHours} hours.
 
 Keep the summary concise and natural.
@@ -9054,32 +9222,140 @@ Include:
 Do not invent information.
 Do not mention that you are an AI.
 Use a friendly WhatsApp-style tone.
-Never expose raw WhatsApp JIDs, LIDs, phone-number identifiers,
-or strings such as @123456789 in the summary.
-If a person's identity is unclear, say "someone" instead.
+
+IMPORTANT:
+The conversation contains internal identity markers.
+
+[[USER:user_1]] means that person's message.
+[[MENTION:user_1]] means that person was mentioned.
+
+When referring to a specific person, preserve the appropriate marker exactly.
+For example:
+"[[MENTION:user_1]] was joking about it 😂"
+
+Do NOT output raw WhatsApp JIDs, LIDs, phone numbers,
+or strings such as @123456789.
 
 CONVERSATION:
 ${limitedSummaryContext}
 `;
 
-          const summary = await askSilverAI(
-            summaryPrompt,
-            ""
-          );
+            let summary =
+              await askSilverAI(
+                summaryPrompt,
+                ""
+              );
 
-          if (!summary) {
+            if (!summary) {
+              await sock.sendMessage(groupJid, {
+                text:
+                  "❌ I couldn't generate the summary right now. Try again shortly."
+              });
+              return;
+            }
+
+            const mentions = [];
+
+            // Convert Gemini's internal markers into
+            // real WhatsApp @mentions.
+            for (const user of users.values()) {
+              const markerPatterns = [
+                `[[MENTION:${user.token}]]`,
+                `[[USER:${user.token}]]`
+              ];
+
+              for (const marker of markerPatterns) {
+                if (summary.includes(marker)) {
+                  summary =
+                    summary.split(marker).join(
+                      `@${user.name}`
+                    );
+
+                  if (
+                    user.jid &&
+                    !mentions.includes(user.jid)
+                  ) {
+                    mentions.push(user.jid);
+                  }
+                }
+              }
+            }
+
+            // Fallback: if Gemini naturally wrote a known
+            // person's name instead of preserving the marker,
+            // turn an unambiguous name into a real mention.
+            const namedUsers =
+              [...users.values()]
+                .filter(user =>
+                  user.name &&
+                  user.name !== "someone"
+                )
+                .sort(
+                  (a, b) =>
+                    b.name.length - a.name.length
+                );
+
+            for (const user of namedUsers) {
+              const sameNameCount =
+                namedUsers.filter(
+                  other =>
+                    other.name.toLowerCase() ===
+                    user.name.toLowerCase()
+                ).length;
+
+              if (sameNameCount !== 1) {
+                continue;
+              }
+
+              const escapedName =
+                user.name.replace(
+                  /[.*+?^${}()|[\]\\]/g,
+                  "\\$&"
+                );
+
+              const nameRegex =
+                new RegExp(
+                  `(?<!@)\\b${escapedName}\\b`,
+                  "gi"
+                );
+
+              if (nameRegex.test(summary)) {
+                summary =
+                  summary.replace(
+                    nameRegex,
+                    `@${user.name}`
+                  );
+
+                if (
+                  user.jid &&
+                  !mentions.includes(user.jid)
+                ) {
+                  mentions.push(user.jid);
+                }
+              }
+            }
+
+            await sock.sendMessage(groupJid, {
+              text:
+                `📝 *Chat Summary — Last ${requestedHours}h*\n\n` +
+                summary,
+              mentions
+            });
+
+          } catch (error) {
+            logger.error(
+              {
+                group: groupJid,
+                error: error?.message || error
+              },
+              "Chat summary failed"
+            );
+
             await sock.sendMessage(groupJid, {
               text:
                 "❌ I couldn't generate the summary right now. Try again shortly."
             });
-            return;
           }
-
-          await sock.sendMessage(groupJid, {
-            text:
-              `📝 *Chat Summary — Last ${requestedHours}h*\n\n` +
-              summary
-          });
 
           return;
         }
@@ -9114,7 +9390,7 @@ ${limitedSummaryContext}
 
           if (action === "status") {
             await sock.sendMessage(groupJid, {
-              text: `🤖 *Silver Chatbot*\\n\\nStatus: *${enabled ? "ON 🟢" : "OFF 🔴"}*`
+              text: `🤖 *Silver Chatbot*\n\nStatus: *${enabled ? "ON 🟢" : "OFF 🔴"}*`
             });
             return;
           }
