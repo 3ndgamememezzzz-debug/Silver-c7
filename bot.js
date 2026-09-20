@@ -9063,181 +9063,148 @@ if (command === "kick") {
             const participants =
               metadata?.participants || [];
 
+            const safeNormalize = (jid) => {
+              if (!jid) return "";
+
+              try {
+                return normalizeJid(jid);
+              } catch (_) {
+                return String(jid);
+              }
+            };
+
             const resolveParticipant = (jid) => {
               if (!jid) return null;
 
-              return participants.find((participant) => {
-                if (!participant?.id) return false;
-
+              return participants.find(participant => {
                 const ids = [
-                  participant.id,
-                  participant.lid,
-                  participant.phoneNumber
+                  participant?.id,
+                  participant?.lid,
+                  participant?.phoneNumber
                 ].filter(Boolean);
 
                 return ids.some(id =>
                   id === jid ||
-                  normalizeJid(id) === normalizeJid(jid)
+                  safeNormalize(id) === safeNormalize(jid)
                 );
               }) || null;
             };
 
-            const getParticipantName = (participant) => {
-              if (!participant) return "someone";
+            const botIds = [
+              sock.user?.id,
+              sock.user?.lid,
+              myJid
+            ].filter(Boolean);
 
-              return (
+            const botParticipant =
+              participants.find(participant => {
+                const ids = [
+                  participant?.id,
+                  participant?.lid,
+                  participant?.phoneNumber
+                ].filter(Boolean);
+
+                return ids.some(id =>
+                  botIds.some(botId =>
+                    id === botId ||
+                    safeNormalize(id) === safeNormalize(botId)
+                  )
+                );
+              }) || null;
+
+            const botCanonicalJid =
+              botParticipant?.id || null;
+
+            const users = new Map();
+
+            for (const msg of recentMessages) {
+              const participant =
+                resolveParticipant(msg.user_jid);
+
+              if (!participant?.id) continue;
+
+              if (
+                botCanonicalJid &&
+                (
+                  participant.id === botCanonicalJid ||
+                  safeNormalize(participant.id) ===
+                    safeNormalize(botCanonicalJid)
+                )
+              ) {
+                continue;
+              }
+
+              const name =
                 participant.notify ||
                 participant.name ||
                 participant.verifiedName ||
-                participant.id?.split("@")[0] ||
-                "someone"
-              );
-            };
+                msg.user_name ||
+                "";
 
-            const users = new Map();
-            let userCounter = 0;
+              if (!name) continue;
 
-            const getUserMarker = (
-              jid,
-              preferredName = null
-            ) => {
-              const participant =
-                resolveParticipant(jid);
-
-              const canonicalJid =
-                participant?.id ||
-                jid;
-
-              const key =
-                normalizeJid(canonicalJid);
-
-              if (!key) {
-                return null;
-              }
-
-              if (users.has(key)) {
-                return users.get(key);
-              }
-
-              userCounter += 1;
-
-              const token =
-                `user_${userCounter}`;
-
-              const name =
-                preferredName ||
-                getParticipantName(participant);
-
-              users.set(key, {
-                token,
-                jid: canonicalJid,
-                name:
-                  name ||
-                  "someone"
+              users.set(participant.id, {
+                jid: participant.id,
+                name
               });
-
-              return users.get(key);
-            };
+            }
 
             const conversationText =
               recentMessages
                 .map(msg => {
-                  const sender =
-                    getUserMarker(
-                      msg.user_jid,
-                      msg.user_name || null
-                    );
+                  const participant =
+                    resolveParticipant(msg.user_jid);
 
-                  const senderLabel =
-                    sender
-                      ? `[[USER:${sender.token}]]`
-                      : "someone";
+                  const name =
+                    participant?.notify ||
+                    participant?.name ||
+                    participant?.verifiedName ||
+                    msg.user_name ||
+                    "someone";
 
-                  let content =
-                    msg.message_text || "";
-
-                  // Resolve raw @123... references to
-                  // internal markers before Gemini sees them.
-                  content =
-                    content.replace(
-                      /@(\d{6,})/g,
-                      (fullMatch, digits) => {
-                        const candidates = [
-                          `${digits}@s.whatsapp.net`,
-                          `${digits}@lid`
-                        ];
-
-                        let participant = null;
-
-                        for (const candidate of candidates) {
-                          participant =
-                            resolveParticipant(candidate);
-
-                          if (participant) break;
-                        }
-
-                        if (!participant) {
-                          return "@someone";
-                        }
-
-                        const mentionedUser =
-                          getUserMarker(
-                            participant.id,
-                            null
-                          );
-
-                        if (!mentionedUser) {
-                          return "@someone";
-                        }
-
-                        return (
-                          `[[MENTION:${mentionedUser.token}]]`
-                        );
-                      }
-                    );
-
-                  return (
-                    `${senderLabel}: ${content}`
-                  );
+                  return `${name}: ${msg.message_text || ""}`;
                 })
                 .join("\n");
 
-            const limitedSummaryContext =
-              limitGeminiContext(
-                conversationText
-              );
+            const limitedContext =
+              limitGeminiContext(conversationText);
+
+            const peopleList =
+              [...users.values()]
+                .map(user => user.name)
+                .join(", ");
 
             const summaryPrompt = `
 Summarize this WhatsApp group conversation from the last ${requestedHours} hours.
 
 Keep the summary concise and natural.
 
+Available participant names:
+${peopleList || "None"}
+
+When referring to people, use their exact names from the list above.
+
+Do NOT:
+- invent names
+- write @someone
+- write raw WhatsApp JIDs
+- write phone-number identifiers
+- write fake @123456789 mentions
+- refer to a known person as "someone"
+
 Include:
-- Main topics discussed
-- Important events or announcements
-- Funny or notable moments if relevant
-- Decisions or plans people made
-- Unresolved questions or arguments if relevant
+- Main topics
+- Important announcements
+- Funny or notable moments
+- Plans or decisions
+- Unresolved questions or arguments when relevant
 
-Do not invent information.
-Do not mention that you are an AI.
 Use a friendly WhatsApp-style tone.
-
-IMPORTANT:
-The conversation contains internal identity markers.
-
-[[USER:user_1]] means that person's message.
-[[MENTION:user_1]] means that person was mentioned.
-
-When referring to a specific person, preserve the appropriate marker exactly.
-For example:
-"[[MENTION:user_1]] was joking about it 😂"
-
-Do NOT output raw WhatsApp JIDs, LIDs, phone numbers,
-or strings such as @123456789.
+Do not mention that you are an AI.
+Do not invent information.
 
 CONVERSATION:
-${limitedSummaryContext}
+${limitedContext}
 `;
 
             let summary =
@@ -9254,60 +9221,22 @@ ${limitedSummaryContext}
               return;
             }
 
+            summary =
+              summary
+                .replace(/@someone/gi, "someone")
+                .replace(/@\d{6,}/g, "");
+
             const mentions = [];
 
-            // Convert Gemini's internal markers into
-            // real WhatsApp @mentions.
-            for (const user of users.values()) {
-              const markerPatterns = [
-                `[[MENTION:${user.token}]]`,
-                `[[USER:${user.token}]]`
-              ];
-
-              for (const marker of markerPatterns) {
-                if (summary.includes(marker)) {
-                  summary =
-                    summary.split(marker).join(
-                      `@${user.name}`
-                    );
-
-                  if (
-                    user.jid &&
-                    !mentions.includes(user.jid)
-                  ) {
-                    mentions.push(user.jid);
-                  }
-                }
-              }
-            }
-
-            // Fallback: if Gemini naturally wrote a known
-            // person's name instead of preserving the marker,
-            // turn an unambiguous name into a real mention.
-            const namedUsers =
+            const usersSorted =
               [...users.values()]
-                .filter(user =>
-                  user.name &&
-                  user.name !== "someone"
-                )
                 .sort(
                   (a, b) =>
                     b.name.length - a.name.length
                 );
 
-            for (const user of namedUsers) {
-              const sameNameCount =
-                namedUsers.filter(
-                  other =>
-                    other.name.toLowerCase() ===
-                    user.name.toLowerCase()
-                ).length;
-
-              if (sameNameCount !== 1) {
-                continue;
-              }
-
-              const escapedName =
+            for (const user of usersSorted) {
+              const escaped =
                 user.name.replace(
                   /[.*+?^${}()|[\]\\]/g,
                   "\\$&"
@@ -9315,7 +9244,7 @@ ${limitedSummaryContext}
 
               const nameRegex =
                 new RegExp(
-                  `(?<!@)\\b${escapedName}\\b`,
+                  `(?<!@)\\b${escaped}\\b`,
                   "gi"
                 );
 
@@ -9326,20 +9255,37 @@ ${limitedSummaryContext}
                     `@${user.name}`
                   );
 
-                if (
-                  user.jid &&
-                  !mentions.includes(user.jid)
-                ) {
+                if (!mentions.includes(user.jid)) {
                   mentions.push(user.jid);
                 }
               }
+            }
+
+            if (!mentions.length && users.size) {
+              const people =
+                [...users.values()].slice(0, 5);
+
+              summary +=
+                "\n\n👥 *People involved:* " +
+                people
+                  .map(user =>
+                    `@${user.name}`
+                  )
+                  .join(", ");
+
+              mentions.push(
+                ...people.map(user =>
+                  user.jid
+                )
+              );
             }
 
             await sock.sendMessage(groupJid, {
               text:
                 `📝 *Chat Summary — Last ${requestedHours}h*\n\n` +
                 summary,
-              mentions
+              mentions:
+                [...new Set(mentions)]
             });
 
           } catch (error) {
