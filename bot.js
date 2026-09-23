@@ -459,7 +459,17 @@ const antiBotWarnings = {}; // { groupJid: { userJid: count } }
 
 // Anti-Delete System
 let antiDeleteEnabled = false; // Global toggle for anti-delete
-const messageCache = new Map(); // Cache messages for anti-delete { messageId: messageData }
+
+const messageCache = new Map();
+
+// 🛡️ Anti-Crash: recent messages by sender
+// Keeps message keys for the last 60 seconds so malformed
+// crash payloads can trigger cleanup of the attacker's recent messages.
+const crashMessageCache = new Map();
+
+const CRASH_MESSAGE_WINDOW = 60 * 1000;
+
+// Cache messages for anti-delete { messageId: messageData }
 const MAX_CACHE_SIZE = 1000; // Maximum messages to cache
 const CACHE_EXPIRY = 30 * 60 * 1000; // 30 minutes expiry
 
@@ -3613,40 +3623,37 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
     try {
       const message = m.messages[0];
       // ============================================================
-      // 🛡️ EARLY CRASH-MESSAGE DEFENSE
+      // 🛡️ EARLY CRASH-MESSAGE DEFENSE V2
       // ============================================================
       //
-      // Runs before Silver-bot's normal message processing.
+      // Detects the malformed message pattern observed in the group:
       //
-      // This defense deliberately avoids treating normal forwarded
-      // messages, protocol messages, stickers, reactions, etc. as
-      // attacks.
+      //   messageContextInfo + botForwardedMessage
       //
-      // It looks for clearly abnormal message-object structures:
-      //   - extremely large top-level structures
-      //   - unusually large immediate child structures
-      //   - unusually deep nested object structures
+      // Once detected:
+      //   1. Delete the triggering message
+      //   2. Delete that sender's messages from the previous 60 seconds
+      //   3. Remove the sender from the group
+      //   4. Announce the protection action
+      //   5. Stop the suspicious message from normal processing
       //
-      // When a message crosses the strict structural thresholds:
-      //   1. Log the incident
-      //   2. Attempt to delete the message
-      //   3. Attempt to remove the sender from the group
-      //   4. Stop further processing of that message
-      //
-      // IMPORTANT:
-      // This cannot guarantee protection against a WhatsApp
-      // client-side rendering vulnerability. If WhatsApp crashes
-      // before the message can be processed, the bot cannot
-      // intercept it.
+      // ============================================================
 
       try {
         const earlyJid = message?.key?.remoteJid;
         const earlyMessage = message?.message;
 
-        // ------------------------------------------------------------
-        // 1️⃣ Ignore broadcast/system messages
-        // ------------------------------------------------------------
+        // Ignore invalid messages.
+        if (
+          !message ||
+          typeof message !== "object" ||
+          !message.key ||
+          typeof message.key !== "object"
+        ) {
+          return;
+        }
 
+        // Ignore broadcast/status messages.
         if (
           earlyJid === "status@broadcast" ||
           earlyJid === "broadcast" ||
@@ -3655,236 +3662,325 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           return;
         }
 
-        // ------------------------------------------------------------
-        // 2️⃣ Validate message object
-        // ------------------------------------------------------------
-
-        if (
-          !message ||
-          typeof message !== "object" ||
-          !message.key ||
-          typeof message.key !== "object"
-        ) {
-          logger.warn(
-            "🛡️ Ignored malformed WhatsApp message object."
-          );
-          return;
-        }
-
+        // Ignore malformed non-object payloads.
         if (
           earlyMessage !== undefined &&
           earlyMessage !== null &&
           typeof earlyMessage !== "object"
         ) {
-          logger.warn(
-            "🛡️ Ignored malformed WhatsApp message payload."
-          );
           return;
         }
 
-        // Nothing to inspect.
         if (!earlyMessage) {
           return;
         }
 
-        // ------------------------------------------------------------
-        // 3️⃣ Only apply active crash enforcement to groups
-        // ------------------------------------------------------------
-
+        // Only enforce crash protection in groups.
         const isEarlyGroup =
           typeof earlyJid === "string" &&
           earlyJid.endsWith("@g.us");
 
-        if (!isEarlyGroup) {
-          // DMs are intentionally not subjected to crash-message enforcement.
-          // Continue with Silver-bot's normal processing below.
-        } else {
+        if (isEarlyGroup) {
 
-        // ------------------------------------------------------------
-        // 4️⃣ Safe shallow structural inspection
-        // ------------------------------------------------------------
+          const now = Date.now();
 
-        const rootKeys = Object.keys(earlyMessage);
+          // ----------------------------------------------------------
+          // Identify sender
+          // ----------------------------------------------------------
 
-        let childKeyCount = 0;
-        let nestedObjectCount = 0;
+          const attackerJid =
+            message?.key?.participant ||
+            message?.participant ||
+            message?.key?.remoteJid;
 
-        // Inspect only a limited number of root keys.
-        for (const key of rootKeys.slice(0, 60)) {
-          try {
-            const value = earlyMessage[key];
+          const validSender =
+            attackerJid &&
+            attackerJid !== earlyJid &&
+            !attackerJid.endsWith("@g.us") &&
+            !attackerJid.endsWith("@broadcast");
 
-            if (
-              value &&
-              typeof value === "object" &&
-              !Array.isArray(value)
-            ) {
-              const level1Keys = Object.keys(value);
+          // ----------------------------------------------------------
+          // Save message for 60-second cleanup
+          // ----------------------------------------------------------
 
-              childKeyCount += level1Keys.length;
-              nestedObjectCount++;
+          if (validSender && message?.key?.id) {
 
-              // Only inspect another shallow level.
-              for (const childKey of level1Keys.slice(0, 40)) {
-                try {
-                  const childValue = value[childKey];
+            const cacheKey =
+              `${earlyJid}:${attackerJid}`;
 
-                  if (
-                    childValue &&
-                    typeof childValue === "object" &&
-                    !Array.isArray(childValue)
-                  ) {
-                    nestedObjectCount++;
-                  }
-                } catch (_) {}
-              }
+            let senderMessages =
+              crashMessageCache.get(cacheKey);
+
+            if (!senderMessages) {
+              senderMessages = [];
             }
-          } catch (_) {}
-        }
 
-        // ------------------------------------------------------------
-        // 5️⃣ Conservative crash indicators
-        // ------------------------------------------------------------
-        //
-        // These thresholds are intentionally high so ordinary
-        // WhatsApp messages should not trigger enforcement.
+            senderMessages.push({
+              key: message.key,
+              timestamp: now
+            });
 
-        const extremeRootSize =
-          rootKeys.length > 60;
+            const cutoff =
+              now - CRASH_MESSAGE_WINDOW;
 
-        const extremeChildSize =
-          childKeyCount > 250;
+            senderMessages =
+              senderMessages.filter(
+                entry =>
+                  entry &&
+                  entry.key &&
+                  entry.timestamp >= cutoff
+              );
 
-        const extremeNesting =
-          nestedObjectCount > 80;
-
-        const clearlyAbnormal =
-          extremeRootSize ||
-          extremeChildSize ||
-          extremeNesting;
-
-        // ------------------------------------------------------------
-        // 6️⃣ Normal message → continue normally
-        // ------------------------------------------------------------
-
-        if (!clearlyAbnormal) {
-          // Normal message → continue with Silver-bot's
-          // normal processing below.
-        } else {
-
-        // ------------------------------------------------------------
-        // 7️⃣ Attack detected
-        // ------------------------------------------------------------
-
-        const attackerJid =
-          message?.key?.participant ||
-          message?.participant ||
-          message?.key?.remoteJid;
-
-        const messageId =
-          message?.key?.id || "unknown";
-
-        logger.warn(
-          {
-            groupJid: earlyJid,
-            attackerJid,
-            messageId,
-            messageKeys: rootKeys.slice(0, 60),
-            rootKeyCount: rootKeys.length,
-            childKeyCount,
-            nestedObjectCount,
-            extremeRootSize,
-            extremeChildSize,
-            extremeNesting
-          },
-          "🚨 POSSIBLE CRASH-MESSAGE ATTACK DETECTED"
-        );
-
-        // ------------------------------------------------------------
-        // 8️⃣ Attempt to delete the suspicious message
-        // ------------------------------------------------------------
-
-        try {
-          if (message?.key?.id) {
-            await sock.sendMessage(
-              earlyJid,
-              {
-                delete: message.key
-              }
-            );
-
-            logger.info(
-              {
-                groupJid: earlyJid,
-                messageId
-              },
-              "🗑️ Suspicious crash-message deletion attempted"
+            crashMessageCache.set(
+              cacheKey,
+              senderMessages
             );
           }
-        } catch (deleteError) {
-          logger.warn(
-            {
-              groupJid: earlyJid,
-              messageId,
-              error: deleteError?.message
-            },
-            "⚠️ Could not delete suspicious crash message"
-          );
-        }
 
-        // ------------------------------------------------------------
-        // 9️⃣ Attempt to remove the sender
-        // ------------------------------------------------------------
+          // ----------------------------------------------------------
+          // Detect the exact malformed pattern
+          // ----------------------------------------------------------
 
-        if (
-          attackerJid &&
-          attackerJid !== earlyJid &&
-          !attackerJid.endsWith("@g.us") &&
-          !attackerJid.endsWith("@broadcast")
-        ) {
-          try {
-            await sock.groupParticipantsUpdate(
-              earlyJid,
-              [attackerJid],
-              "remove"
-            );
+          const rootKeys =
+            Object.keys(earlyMessage);
 
-            logger.info(
-              {
-                groupJid: earlyJid,
-                attackerJid
-              },
-              "👢 Possible crash attacker removed"
-            );
-          } catch (removeError) {
+          const hasMessageContextInfo =
+            rootKeys.includes("messageContextInfo");
+
+          const hasBotForwardedMessage =
+            rootKeys.includes("botForwardedMessage");
+
+          const isCrashPattern =
+            hasMessageContextInfo &&
+            hasBotForwardedMessage;
+
+          // ----------------------------------------------------------
+          // Normal message → continue normally
+          // ----------------------------------------------------------
+
+          if (!isCrashPattern) {
+
+            // Clean old cache entries.
+
+            const cutoff =
+              now - CRASH_MESSAGE_WINDOW;
+
+            for (
+              const [cacheKey, entries]
+              of crashMessageCache.entries()
+            ) {
+
+              const freshEntries =
+                entries.filter(
+                  entry =>
+                    entry &&
+                    entry.key &&
+                    entry.timestamp >= cutoff
+                );
+
+              if (freshEntries.length > 0) {
+                crashMessageCache.set(
+                  cacheKey,
+                  freshEntries
+                );
+              } else {
+                crashMessageCache.delete(cacheKey);
+              }
+            }
+
+          } else {
+
+            // --------------------------------------------------------
+            // 🚨 CRASH ATTACK DETECTED
+            // --------------------------------------------------------
+
+            const messageId =
+              message?.key?.id || "unknown";
+
+            const cacheKey =
+              `${earlyJid}:${attackerJid}`;
+
             logger.warn(
               {
                 groupJid: earlyJid,
                 attackerJid,
-                error: removeError?.message
+                messageId,
+                messageKeys: rootKeys,
+                pattern: [
+                  "messageContextInfo",
+                  "botForwardedMessage"
+                ]
               },
-              "⚠️ Could not remove possible crash attacker"
+              "🚨 ANTI-CRASH: MALFORMED MESSAGE ATTACK DETECTED"
             );
+
+            // --------------------------------------------------------
+            // Get attacker's messages from previous 60 seconds
+            // --------------------------------------------------------
+
+            const cutoff =
+              now - CRASH_MESSAGE_WINDOW;
+
+            const recentMessages =
+              crashMessageCache.get(cacheKey) || [];
+
+            const messagesToDelete =
+              recentMessages.filter(
+                entry =>
+                  entry &&
+                  entry.key &&
+                  entry.timestamp >= cutoff
+              );
+
+            // Make sure triggering message is included.
+            if (
+              message?.key?.id &&
+              !messagesToDelete.some(
+                entry =>
+                  entry.key?.id === message.key.id
+              )
+            ) {
+              messagesToDelete.push({
+                key: message.key,
+                timestamp: now
+              });
+            }
+
+            // --------------------------------------------------------
+            // Delete recent attacker messages
+            // --------------------------------------------------------
+
+            let deletedCount = 0;
+
+            for (const entry of messagesToDelete) {
+
+              try {
+
+                await sock.sendMessage(
+                  earlyJid,
+                  {
+                    delete: entry.key
+                  }
+                );
+
+                deletedCount++;
+
+              } catch (deleteError) {
+
+                logger.warn(
+                  {
+                    groupJid: earlyJid,
+                    attackerJid,
+                    messageId: entry.key?.id,
+                    error: deleteError?.message
+                  },
+                  "⚠️ Anti-Crash could not delete message"
+                );
+              }
+            }
+
+            logger.info(
+              {
+                groupJid: earlyJid,
+                attackerJid,
+                deletedCount
+              },
+              "🗑️ Anti-Crash recent-message cleanup completed"
+            );
+
+            // Clear sender's crash cache.
+            crashMessageCache.delete(cacheKey);
+
+            // --------------------------------------------------------
+            // Remove attacker
+            // --------------------------------------------------------
+
+            if (validSender) {
+
+              try {
+
+                await sock.groupParticipantsUpdate(
+                  earlyJid,
+                  [attackerJid],
+                  "remove"
+                );
+
+                logger.info(
+                  {
+                    groupJid: earlyJid,
+                    attackerJid
+                  },
+                  "👢 Anti-Crash attacker removed"
+                );
+
+              } catch (removeError) {
+
+                logger.warn(
+                  {
+                    groupJid: earlyJid,
+                    attackerJid,
+                    error: removeError?.message
+                  },
+                  "⚠️ Anti-Crash could not remove attacker"
+                );
+              }
+            }
+
+            // --------------------------------------------------------
+            // Announce protection
+            // --------------------------------------------------------
+
+            try {
+
+              const userNumber =
+                String(attackerJid || "")
+                  .split("@")[0];
+
+              await sock.sendMessage(
+                earlyJid,
+                {
+                  text:
+                    "╭━━━〔 🛡️ SILVER ANTI-CRASH 〕━━━╮\n\n" +
+                    "🚨 Malformed message attack detected.\n" +
+                    `👤 @${userNumber}\n\n` +
+                    `🗑️ Deleted ${deletedCount} recent message(s).\n` +
+                    "👢 Attacker removed from the group.\n" +
+                    "🔒 Group protection activated.\n\n" +
+                    "╰━━━━━━━━━━━━━━━━━━━━━━━━━━╯",
+
+                  mentions:
+                    validSender
+                      ? [attackerJid]
+                      : []
+                }
+              );
+
+            } catch (announceError) {
+
+              logger.warn(
+                {
+                  groupJid: earlyJid,
+                  error: announceError?.message
+                },
+                "⚠️ Anti-Crash announcement failed"
+              );
+            }
+
+            // Never allow suspicious payload to continue.
+            return;
           }
         }
 
-        // ------------------------------------------------------------
-        // 🔟 STOP processing the suspicious message
-        // ------------------------------------------------------------
-
-        return;
-
-        }
-        }
-
       } catch (crashDefenseError) {
-        // The defense itself must NEVER crash Silver-bot.
+
+        // The anti-crash system itself must NEVER
+        // crash Silver Bot.
 
         logger.error(
           {
             error: crashDefenseError?.message
           },
-          "🛡️ Crash-defense layer error"
+          "🛡️ Anti-Crash defense layer error"
         );
       }
 
