@@ -9107,6 +9107,7 @@ if (command === "kick") {
         }
 
         // ============================================
+        // ============================================
         // 📝 CHAT SUMMARY COMMAND
         // ============================================
         if (command === "summary") {
@@ -9159,6 +9160,9 @@ if (command === "kick") {
             const participants =
               metadata?.participants || [];
 
+            const activity =
+              groupActivity[groupJid] || {};
+
             const safeNormalize = (jid) => {
               if (!jid) return "";
 
@@ -9169,8 +9173,40 @@ if (command === "kick") {
               }
             };
 
-            const resolveParticipant = (jid) => {
+            /*
+             * IMPORTANT:
+             * groupActivity already contains the same JIDs used
+             * successfully by .listactive/.inactive.
+             *
+             * Those JIDs are therefore our authoritative mention IDs.
+             */
+            const activityJids =
+              Object.keys(activity);
+
+            const findActivityJid = (jid) => {
               if (!jid) return null;
+
+              const exact =
+                activityJids.find(
+                  activityJid => activityJid === jid
+                );
+
+              if (exact) return exact;
+
+              const normalized =
+                safeNormalize(jid);
+
+              return activityJids.find(
+                activityJid =>
+                  safeNormalize(activityJid) === normalized
+              ) || null;
+            };
+
+            const findParticipant = (jid) => {
+              if (!jid) return null;
+
+              const normalized =
+                safeNormalize(jid);
 
               return participants.find(participant => {
                 const ids = [
@@ -9181,11 +9217,15 @@ if (command === "kick") {
 
                 return ids.some(id =>
                   id === jid ||
-                  safeNormalize(id) === safeNormalize(jid)
+                  safeNormalize(id) === normalized
                 );
               }) || null;
             };
 
+            /*
+             * Resolve the bot's real participant ID so it is never
+             * included in the people list or mentioned.
+             */
             const botIds = [
               sock.user?.id,
               sock.user?.lid,
@@ -9203,59 +9243,120 @@ if (command === "kick") {
                 return ids.some(id =>
                   botIds.some(botId =>
                     id === botId ||
-                    safeNormalize(id) === safeNormalize(botId)
+                    safeNormalize(id) ===
+                      safeNormalize(botId)
                   )
                 );
               }) || null;
 
-            const botCanonicalJid =
-              botParticipant?.id || null;
+            const botJid =
+              botParticipant?.id ||
+              myJid ||
+              sock.user?.id ||
+              null;
 
+            const isBotJid = (jid) => {
+              if (!jid || !botJid) return false;
+
+              return (
+                jid === botJid ||
+                safeNormalize(jid) ===
+                  safeNormalize(botJid)
+              );
+            };
+
+            /*
+             * Build a map of people who actually appear in the
+             * requested chat window.
+             *
+             * The final jid always comes from groupActivity,
+             * matching the identity system used by .listactive.
+             */
             const users = new Map();
 
-            for (const msg of recentMessages) {
-              const participant =
-                resolveParticipant(msg.user_jid);
+            const resolveSummaryUser = (msg) => {
+              const storedJid =
+                msg?.user_jid || "";
 
-              if (!participant?.id) continue;
+              // First: exact activity identity.
+              let jid =
+                findActivityJid(storedJid);
 
-              if (
-                botCanonicalJid &&
-                (
-                  participant.id === botCanonicalJid ||
-                  safeNormalize(participant.id) ===
-                    safeNormalize(botCanonicalJid)
-                )
-              ) {
-                continue;
+              // Second: resolve through current participant,
+              // then find that participant's activity identity.
+              if (!jid) {
+                const participant =
+                  findParticipant(storedJid);
+
+                if (participant) {
+                  jid =
+                    findActivityJid(participant.id);
+
+                  if (!jid) {
+                    jid =
+                      activityJids.find(activityJid => {
+                        const activityParticipant =
+                          findParticipant(activityJid);
+
+                        return (
+                          activityParticipant?.id &&
+                          safeNormalize(
+                            activityParticipant.id
+                          ) ===
+                            safeNormalize(participant.id)
+                        );
+                      }) || null;
+                  }
+                }
               }
 
+              return jid;
+            };
+
+            for (const msg of recentMessages) {
+              const jid =
+                resolveSummaryUser(msg);
+
+              if (!jid || isBotJid(jid)) continue;
+
+              const participant =
+                findParticipant(jid);
+
               const name =
-                participant.notify ||
-                participant.name ||
-                participant.verifiedName ||
-                msg.user_name ||
-                "";
+                participant?.notify ||
+                participant?.name ||
+                participant?.verifiedName ||
+                msg?.user_name ||
+                jid.split("@")[0];
 
               if (!name) continue;
 
-              users.set(participant.id, {
-                jid: participant.id,
+              users.set(jid, {
+                jid,
                 name
               });
             }
 
+            /*
+             * Conversation sent to Gemini.
+             * Use the best available name, but never expose raw JIDs.
+             */
             const conversationText =
               recentMessages
                 .map(msg => {
+                  const jid =
+                    resolveSummaryUser(msg);
+
                   const participant =
-                    resolveParticipant(msg.user_jid);
+                    jid
+                      ? findParticipant(jid)
+                      : findParticipant(msg?.user_jid);
 
                   const name =
                     participant?.notify ||
                     participant?.name ||
                     participant?.verifiedName ||
-                    msg.user_name ||
+                    msg?.user_name ||
                     "someone";
 
                   return `${name}: ${msg.message_text || ""}`;
@@ -9273,9 +9374,9 @@ if (command === "kick") {
             const summaryPrompt = `
 Summarize this WhatsApp group conversation from the last ${requestedHours} hours.
 
-Keep the summary concise and natural.
+Keep the summary concise, natural and useful.
 
-Available participant names:
+People who actually participated:
 ${peopleList || "None"}
 
 When referring to people, use their exact names from the list above.
@@ -9286,7 +9387,7 @@ Do NOT:
 - write raw WhatsApp JIDs
 - write phone-number identifiers
 - write fake @123456789 mentions
-- refer to a known person as "someone"
+- call a known participant "someone"
 
 Include:
 - Main topics
@@ -9317,6 +9418,11 @@ ${limitedContext}
               return;
             }
 
+            /*
+             * Gemini writes names, not WhatsApp mentions.
+             * Convert only names belonging to our verified users
+             * into real WhatsApp mentions.
+             */
             summary =
               summary
                 .replace(/@someone/gi, "someone")
@@ -9357,6 +9463,11 @@ ${limitedContext}
               }
             }
 
+            /*
+             * If Gemini didn't mention any participant by name,
+             * still show the actual people involved using the same
+             * clickable-JID method as .listactive.
+             */
             if (!mentions.length && users.size) {
               const people =
                 [...users.values()].slice(0, 5);
@@ -9402,7 +9513,6 @@ ${limitedContext}
           return;
         }
 
-        // ============================================
         // 🤖 Chatbot Command
         // ============================================
         if (command === "chatbot") {
