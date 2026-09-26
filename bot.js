@@ -4220,6 +4220,54 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         text = message.message.videoMessage.caption;
 
       // ============================================
+      // 🤖 TEMP CHATBOT TRIGGER DEBUG
+      // ============================================
+      if (isGroup && !message.key.fromMe) {
+        const debugContextInfo =
+          message.message?.extendedTextMessage?.contextInfo ||
+          message.message?.imageMessage?.contextInfo ||
+          message.message?.videoMessage?.contextInfo ||
+          message.message?.documentMessage?.contextInfo ||
+          message.message?.stickerMessage?.contextInfo ||
+          null;
+
+        console.log("\n================ CHATBOT DEBUG ================");
+        console.log("📩 TEXT:", text);
+        console.log("👤 SENDER:", sender);
+        console.log("👤 DISPLAY SENDER:", displaySender);
+        console.log("🏠 GROUP:", message.key.remoteJid);
+        console.log("🤖 BOT ID:", sock.user?.id);
+        console.log("🤖 BOT LID:", sock.user?.lid);
+        console.log(
+          "🧩 MESSAGE TYPES:",
+          Object.keys(message.message || {})
+        );
+        console.log(
+          "📣 MENTIONED JIDS:",
+          debugContextInfo?.mentionedJid || []
+        );
+        console.log(
+          "↩️ QUOTED STANZA ID:",
+          debugContextInfo?.stanzaId || null
+        );
+        console.log(
+          "↩️ QUOTED PARTICIPANT:",
+          debugContextInfo?.participant || null
+        );
+        console.log(
+          "↩️ QUOTED MESSAGE TYPES:",
+          debugContextInfo?.quotedMessage
+            ? Object.keys(debugContextInfo.quotedMessage)
+            : []
+        );
+        console.log(
+          "📝 CONTEXT INFO:",
+          JSON.stringify(debugContextInfo, null, 2)
+        );
+        console.log("================================================\n");
+      }
+
+      // ============================================
       // Anti-Delete: Cache messages for recovery
       // ============================================
       if (antiDeleteEnabled && !message.key.fromMe) {
