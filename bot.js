@@ -4527,7 +4527,7 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
             await getRecentChatMessages(
               chatbotGroupJid,
               24,
-              60
+              20
             );
 
           const recentContext =
@@ -4548,21 +4548,38 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
               recentContext
             );
 
-          const aiReply =
-            await askSilverAI(
-              text || "Say something playful.",
-              limitedRecentContext
-            );
+          // 🤖 Ask Gemini, with one quick retry if the first request fails.
+          let aiReply = null;
+
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            aiReply =
+              await askSilverAI(
+                text || "Say something playful.",
+                limitedRecentContext
+              );
+
+            if (aiReply) break;
+
+            if (attempt === 1) {
+              await new Promise(resolve =>
+                setTimeout(resolve, 350)
+              );
+            }
+          }
 
           if (aiReply) {
             recordChatbotUsage(
               chatbotGroupJid
             );
 
+            // 💬 Reply directly to the message that triggered Silver.
             await sock.sendMessage(
               chatbotGroupJid,
               {
                 text: aiReply
+              },
+              {
+                quoted: message
               }
             );
           }
