@@ -4222,51 +4222,6 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
       // ============================================
       // 🤖 TEMP CHATBOT TRIGGER DEBUG
       // ============================================
-      if (isGroup && !message.key.fromMe) {
-        const debugContextInfo =
-          message.message?.extendedTextMessage?.contextInfo ||
-          message.message?.imageMessage?.contextInfo ||
-          message.message?.videoMessage?.contextInfo ||
-          message.message?.documentMessage?.contextInfo ||
-          message.message?.stickerMessage?.contextInfo ||
-          null;
-
-        console.log("\n================ CHATBOT DEBUG ================");
-        console.log("📩 TEXT:", text);
-        console.log("👤 SENDER:", sender);
-        console.log("👤 DISPLAY SENDER:", displaySender);
-        console.log("🏠 GROUP:", message.key.remoteJid);
-        console.log("🤖 BOT ID:", sock.user?.id);
-        console.log("🤖 BOT LID:", sock.user?.lid);
-        console.log(
-          "🧩 MESSAGE TYPES:",
-          Object.keys(message.message || {})
-        );
-        console.log(
-          "📣 MENTIONED JIDS:",
-          debugContextInfo?.mentionedJid || []
-        );
-        console.log(
-          "↩️ QUOTED STANZA ID:",
-          debugContextInfo?.stanzaId || null
-        );
-        console.log(
-          "↩️ QUOTED PARTICIPANT:",
-          debugContextInfo?.participant || null
-        );
-        console.log(
-          "↩️ QUOTED MESSAGE TYPES:",
-          debugContextInfo?.quotedMessage
-            ? Object.keys(debugContextInfo.quotedMessage)
-            : []
-        );
-        console.log(
-          "📝 CONTEXT INFO:",
-          JSON.stringify(debugContextInfo, null, 2)
-        );
-        console.log("================================================\n");
-      }
-
       // ============================================
       // Anti-Delete: Cache messages for recovery
       // ============================================
@@ -4457,11 +4412,17 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
       // ============================================
       // 🤖 SILVER AI CHATBOT TRIGGER
       // ============================================
-      // Only runs in groups where .chatbot is ON.
-      // Silver responds to:
-      // 1. Direct mentions of the bot
-      // 2. Replies to the bot's messages
-      // Normal group messages do NOT trigger AI.
+      // Silver responds only when:
+      // 1. Someone mentions Silver
+      // 2. Someone replies to a Silver message
+      //
+      // WhatsApp may give the bot LID as:
+      //   22600671604953:18@lid
+      //
+      // while mentions/replies arrive as:
+      //   22600671604953@lid
+      //
+      // Therefore we compare the JID without the device suffix.
 
       if (
         isGroup &&
@@ -4473,143 +4434,101 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           message.message?.extendedTextMessage?.contextInfo ||
           message.message?.imageMessage?.contextInfo ||
           message.message?.videoMessage?.contextInfo ||
+          message.message?.documentMessage?.contextInfo ||
           {};
 
         const chatbotGroupJid =
           message.key.remoteJid;
 
+        // Remove WhatsApp device suffix:
+        // 123456:18@lid -> 123456@lid
+        const bareJid = (jid) => {
+          if (!jid) return "";
+
+          return String(jid)
+            .trim()
+            .replace(/:\d+(?=@)/, "");
+        };
+
+        const botLid =
+          bareJid(sock.user?.lid);
+
+        const botId =
+          bareJid(sock.user?.id);
+
+        const isSameBotJid = (jid) => {
+          const normalized =
+            bareJid(jid);
+
+          return (
+            normalized === botLid ||
+            normalized === botId
+          );
+        };
+
+        // --------------------------------------------
+        // 📣 MENTION DETECTION
+        // --------------------------------------------
+        const mentionedJids =
+          chatbotContextInfo?.mentionedJid || [];
+
+        const mentionedBot =
+          mentionedJids.some(isSameBotJid);
+
+        // --------------------------------------------
+        // ↩️ REPLY DETECTION
+        // --------------------------------------------
+        const quotedParticipant =
+          chatbotContextInfo?.participant || "";
+
+        const repliedToBot =
+          Boolean(quotedParticipant) &&
+          isSameBotJid(quotedParticipant);
+
+        // --------------------------------------------
+        // 🤖 FINAL TRIGGER
+        // --------------------------------------------
+        const chatbotTriggered =
+          mentionedBot || repliedToBot;
+
+        if (!chatbotTriggered) {
+          return;
+        }
+
+        logger.info(
+          {
+            group: chatbotGroupJid,
+            sender,
+            mentionedBot,
+            repliedToBot,
+            botLid,
+            botId,
+            mentionedJids,
+            quotedParticipant
+          },
+          "🤖 Silver chatbot triggered"
+        );
+
+        // Protect Gemini API from spam.
+        if (!canUseChatbot(chatbotGroupJid)) {
+          return;
+        }
+
         try {
-          const [metadata, recentChat] =
-            await Promise.all([
-              sock.groupMetadata(chatbotGroupJid),
-              getRecentChatMessages(
-                chatbotGroupJid,
-                24,
-                60
-              )
-            ]);
-
-          const participants =
-            metadata?.participants || [];
-
-          const sameParticipant = (a, b) => {
-            if (!a || !b) return false;
-
-            const aIds = [
-              a.id,
-              a.lid,
-              a.phoneNumber
-            ].filter(Boolean);
-
-            const bIds = [
-              b.id,
-              b.lid,
-              b.phoneNumber
-            ].filter(Boolean);
-
-            return aIds.some(aId =>
-              bIds.some(bId =>
-                aId === bId ||
-                normalizeJid(aId) === normalizeJid(bId)
-              )
-            );
-          };
-
-          const resolveParticipant = (jid) => {
-            if (!jid) return null;
-
-            return participants.find((participant) => {
-              if (!participant?.id) return false;
-
-              const ids = [
-                participant.id,
-                participant.lid,
-                participant.phoneNumber
-              ].filter(Boolean);
-
-              return ids.some(id =>
-                id === jid ||
-                normalizeJid(id) === normalizeJid(jid)
-              );
-            }) || null;
-          };
-
-          const botParticipant =
-            participants.find((participant) => {
-              if (!participant?.id) return false;
-
-              const botIds = [
-                sock.user?.id,
-                sock.user?.lid,
-                myJid
-              ].filter(Boolean);
-
-              const participantIds = [
-                participant.id,
-                participant.lid,
-                participant.phoneNumber
-              ].filter(Boolean);
-
-              return participantIds.some(participantId =>
-                botIds.some(botId =>
-                  participantId === botId ||
-                  normalizeJid(participantId) === normalizeJid(botId)
-                )
-              );
-            }) || null;
-
-          let mentionedBot = false;
-          let repliedToBot = false;
-
-          if (botParticipant) {
-            const mentionedJids =
-              chatbotContextInfo?.mentionedJid || [];
-
-            mentionedBot = mentionedJids.some((mentionedJid) => {
-              const targetParticipant =
-                resolveParticipant(mentionedJid);
-
-              return (
-                targetParticipant &&
-                sameParticipant(
-                  targetParticipant,
-                  botParticipant
-                )
-              );
-            });
-
-            const quotedParticipant =
-              chatbotContextInfo?.participant || "";
-
-            if (quotedParticipant) {
-              const repliedParticipant =
-                resolveParticipant(quotedParticipant);
-
-              repliedToBot =
-                Boolean(repliedParticipant) &&
-                sameParticipant(
-                  repliedParticipant,
-                  botParticipant
-                );
-            }
-          }
-
-          if (!mentionedBot && !repliedToBot) {
-            return;
-          }
-
-          // Protect the Gemini API from spam.
-          if (!canUseChatbot(chatbotGroupJid)) {
-            return;
-          }
-
-          // Show WhatsApp typing status while Gemini is thinking.
+          // Show typing status while Gemini thinks.
           try {
             await sock.sendPresenceUpdate(
               "composing",
               chatbotGroupJid
             );
           } catch (_) {}
+
+          const recentChat =
+            await getRecentChatMessages(
+              chatbotGroupJid,
+              24,
+              60
+            );
 
           const recentContext =
             recentChat
@@ -4625,15 +4544,20 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
               .join("\n");
 
           const limitedRecentContext =
-            limitGeminiContext(recentContext);
+            limitGeminiContext(
+              recentContext
+            );
 
-          const aiReply = await askSilverAI(
-            text || "Say something playful.",
-            limitedRecentContext
-          );
+          const aiReply =
+            await askSilverAI(
+              text || "Say something playful.",
+              limitedRecentContext
+            );
 
           if (aiReply) {
-            recordChatbotUsage(chatbotGroupJid);
+            recordChatbotUsage(
+              chatbotGroupJid
+            );
 
             await sock.sendMessage(
               chatbotGroupJid,
@@ -4650,21 +4574,25 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
             );
           } catch (_) {}
 
-          return;
-
         } catch (error) {
           logger.error(
             {
               group: chatbotGroupJid,
               error: error?.message || error
             },
-            "Silver chatbot trigger failed"
+            "Silver chatbot failed"
           );
 
-          return;
+          try {
+            await sock.sendPresenceUpdate(
+              "paused",
+              chatbotGroupJid
+            );
+          } catch (_) {}
         }
-      }
 
+        return;
+      }
 
       // ============================================
       // 🔒 IGNORE UNAUTHORIZED DM COMMANDS
