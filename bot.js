@@ -404,83 +404,13 @@ const userWarns = {};
 const CHAT_MEMORY_MAX_HOURS = 24;
 const CHAT_MEMORY_MAX_MESSAGE_LENGTH = 1200;
 
-const CHATBOT_COOLDOWN_MS = 10 * 1000;
-const CHATBOT_HOURLY_LIMIT = 30;
-
-const chatbotLastResponse = new Map();
-const chatbotHourlyUsage = new Map();
-
 // 🧠 Remember Silver's most recent AI reply in each group.
 // This lets Silver understand when someone is replying to what it just said.
 const lastSilverMessageByGroup = new Map();
 
-// Check whether the group is allowed to use Gemini.
-const canUseChatbot = (groupJid) => {
-  const now = Date.now();
-
-  const lastResponse =
-    chatbotLastResponse.get(groupJid) || 0;
-
-  if (now - lastResponse < CHATBOT_COOLDOWN_MS) {
-    return false;
-  }
-
-  let usage =
-    chatbotHourlyUsage.get(groupJid);
-
-  if (!usage || now - usage.startedAt >= 60 * 60 * 1000) {
-    usage = {
-      startedAt: now,
-      count: 0
-    };
-
-    chatbotHourlyUsage.set(groupJid, usage);
-  }
-
-  if (usage.count >= CHATBOT_HOURLY_LIMIT) {
-    return false;
-  }
-
-  return true;
-};
-
-// Record a successful Gemini response.
-const recordChatbotUsage = (groupJid) => {
-  const now = Date.now();
-
-  chatbotLastResponse.set(groupJid, now);
-
-  let usage =
-    chatbotHourlyUsage.get(groupJid);
-
-  if (!usage || now - usage.startedAt >= 60 * 60 * 1000) {
-    usage = {
-      startedAt: now,
-      count: 0
-    };
-  }
-
-  usage.count += 1;
-  chatbotHourlyUsage.set(groupJid, usage);
-};
-
-// Periodically remove inactive rate-limit entries.
-setInterval(() => {
-  const now = Date.now();
-  const expiry = 60 * 60 * 1000;
-
-  for (const [groupJid, timestamp] of chatbotLastResponse) {
-    if (now - timestamp >= expiry) {
-      chatbotLastResponse.delete(groupJid);
-    }
-  }
-
-  for (const [groupJid, usage] of chatbotHourlyUsage) {
-    if (!usage || now - usage.startedAt >= expiry) {
-      chatbotHourlyUsage.delete(groupJid);
-    }
-  }
-}, 30 * 60 * 1000);
+// 🤖 Silver AI has no local chatbot usage limit.
+// Groq/Gemini provider cooldowns still handle API rate limits.
+const canUseChatbot = () => true;
 
 // Save a normal group message for chatbot context.
 const saveChatMessageToSupabase = async (
@@ -4729,6 +4659,44 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           message.message?.videoMessage?.contextInfo ||
           message.message?.documentMessage?.contextInfo ||
           {};
+
+        // ============================================================
+        // 🧪 TEMP SILVER AI MESSAGE DEBUG
+        // Remove this after testing.
+        // ============================================================
+        console.log("\n================ SILVER AI DEBUG ================");
+        console.log("📩 Message type:", Object.keys(message.message || {}));
+        console.log("📝 Current text:", text);
+        console.log(
+          "📣 mentionedJid:",
+          JSON.stringify(
+            chatbotContextInfo?.mentionedJid || [],
+            null,
+            2
+          )
+        );
+        console.log(
+          "↩️ participant:",
+          chatbotContextInfo?.participant || "(none)"
+        );
+        console.log(
+          "🆔 stanzaId:",
+          chatbotContextInfo?.stanzaId || "(none)"
+        );
+        console.log(
+          "💬 quotedMessage:",
+          JSON.stringify(
+            chatbotContextInfo?.quotedMessage || null,
+            null,
+            2
+          )
+        );
+        console.log(
+          "🔗 contextInfo keys:",
+          Object.keys(chatbotContextInfo || {})
+        );
+        console.log("=================================================\n");
+
 
         const chatbotGroupJid =
           message.key.remoteJid;
