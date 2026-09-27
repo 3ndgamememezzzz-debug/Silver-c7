@@ -20,15 +20,61 @@ const supabase = createClient(
 );
 
 // ============================================
-// 🤖 GEMINI AI CHATBOT
+// 🤖 SILVER AI — GROQ + GEMINI FALLBACK
 // ============================================
 const { GoogleGenAI } = require("@google/genai");
+const Groq = require("groq-sdk");
 
 const gemini = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY
 });
 
+const groq = new Groq({
+  apiKey: process.env.GROQ_API_KEY
+});
+
 const GEMINI_MODEL = "gemini-3.6-flash";
+const GROQ_MODEL = "openai/gpt-oss-20b";
+
+// Keep track of providers that temporarily hit quota/rate limits.
+const aiProviderCooldown = {
+  groq: 0,
+  gemini: 0
+};
+
+const AI_PROVIDER_COOLDOWN_MS = 60 * 1000;
+
+function isProviderAvailable(provider) {
+  return Date.now() >= (aiProviderCooldown[provider] || 0);
+}
+
+function cooldownProvider(provider, seconds = 60) {
+  aiProviderCooldown[provider] =
+    Date.now() + (seconds * 1000);
+
+  console.log(
+    `⏳ ${provider.toUpperCase()} temporarily unavailable. ` +
+    `Silver will try it again in ${seconds}s.`
+  );
+}
+
+function isQuotaError(error) {
+  const status =
+    error?.status ||
+    error?.statusCode ||
+    error?.code;
+
+  const message =
+    error?.message ||
+    "";
+
+  return (
+    Number(status) === 429 ||
+    /quota|rate.?limit|resource.?exhausted|too many requests/i.test(
+      message
+    )
+  );
+}
 
 const SILVER_AI_SYSTEM_PROMPT = `
 You are Silver, a playful WhatsApp group chatbot.
@@ -57,34 +103,130 @@ CHAT STYLE:
 `;
 
 async function askSilverAI(userMessage, context = "") {
-  try {
-    if (!process.env.GEMINI_API_KEY) {
-      console.error("❌ GEMINI_API_KEY is missing.");
-      return null;
-    }
-
-    const prompt = `${SILVER_AI_SYSTEM_PROMPT}
+  const prompt = `${SILVER_AI_SYSTEM_PROMPT}
 
 ${context ? `RECENT CONTEXT:\n${context}\n\n` : ""}USER MESSAGE:
 ${userMessage}`;
 
-    const response = await gemini.models.generateContent({
-      model: GEMINI_MODEL,
-      contents: prompt
-    });
+  const providers = [];
 
-    const reply = response?.text?.trim();
+  // Prefer Groq first when available.
+  if (isProviderAvailable("groq")) {
+    providers.push("groq");
+  }
 
-    if (!reply) {
-      console.error("❌ Gemini returned an empty response.");
-      return null;
-    }
+  // Gemini becomes the automatic fallback.
+  if (isProviderAvailable("gemini")) {
+    providers.push("gemini");
+  }
 
-    return reply;
-  } catch (error) {
-    console.error("❌ Silver AI error:", error?.message || error);
+  if (!providers.length) {
+    console.log(
+      "⏳ Silver AI: Groq and Gemini are temporarily unavailable."
+    );
+
     return null;
   }
+
+  for (const provider of providers) {
+    try {
+      console.log(`🤖 Silver AI trying ${provider.toUpperCase()}...`);
+
+      // -------------------------
+      // GROQ
+      // -------------------------
+      if (provider === "groq") {
+        if (!process.env.GROQ_API_KEY) {
+          console.error("❌ GROQ_API_KEY is missing.");
+          continue;
+        }
+
+        const response =
+          await groq.chat.completions.create({
+            model: GROQ_MODEL,
+            messages: [
+              {
+                role: "system",
+                content: SILVER_AI_SYSTEM_PROMPT
+              },
+              {
+                role: "user",
+                content:
+                  `${context ? `RECENT CONTEXT:\n${context}\n\n` : ""}` +
+                  `USER MESSAGE:\n${userMessage}`
+              }
+            ],
+            max_completion_tokens: 500,
+            temperature: 0.8
+          });
+
+        const reply =
+          response?.choices?.[0]?.message?.content?.trim();
+
+        if (reply) {
+          console.log("✅ Silver AI replied using GROQ.");
+          return reply;
+        }
+
+        console.error("❌ Groq returned an empty response.");
+        continue;
+      }
+
+      // -------------------------
+      // GEMINI
+      // -------------------------
+      if (provider === "gemini") {
+        if (!process.env.GEMINI_API_KEY) {
+          console.error("❌ GEMINI_API_KEY is missing.");
+          continue;
+        }
+
+        const response =
+          await gemini.models.generateContent({
+            model: GEMINI_MODEL,
+            contents: prompt
+          });
+
+        const reply =
+          response?.text?.trim();
+
+        if (reply) {
+          console.log("✅ Silver AI replied using GEMINI.");
+          return reply;
+        }
+
+        console.error("❌ Gemini returned an empty response.");
+        continue;
+      }
+
+    } catch (error) {
+      const status =
+        error?.status ||
+        error?.statusCode ||
+        error?.code ||
+        "";
+
+      console.error(
+        `❌ ${provider.toUpperCase()} AI error:`,
+        error?.message || error
+      );
+
+      // If quota/rate limited, temporarily disable
+      // that provider and immediately try the other one.
+      if (isQuotaError(error)) {
+        cooldownProvider(
+          provider,
+          provider === "gemini" ? 60 : 60
+        );
+      }
+    }
+  }
+
+  console.error(
+    "❌ Silver AI: all available providers failed."
+  );
+
+  return null;
 }
 const path = require("path");
 const sharp = require("sharp");
@@ -4548,24 +4690,11 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
               recentContext
             );
 
-          // 🤖 Ask Gemini, with one quick retry if the first request fails.
-          let aiReply = null;
-
-          for (let attempt = 1; attempt <= 2; attempt++) {
-            aiReply =
-              await askSilverAI(
-                text || "Say something playful.",
-                limitedRecentContext
-              );
-
-            if (aiReply) break;
-
-            if (attempt === 1) {
-              await new Promise(resolve =>
-                setTimeout(resolve, 350)
-              );
-            }
-          }
+          // 🤖 Ask Silver AI with automatic Groq ↔ Gemini fallback.
+          const aiReply = await askSilverAI(
+            text || "Say something playful.",
+            limitedRecentContext
+          );
 
           if (aiReply) {
             recordChatbotUsage(
