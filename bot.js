@@ -4660,44 +4660,6 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           message.message?.documentMessage?.contextInfo ||
           {};
 
-        // ============================================================
-        // 🧪 TEMP SILVER AI MESSAGE DEBUG
-        // Remove this after testing.
-        // ============================================================
-        console.log("\n================ SILVER AI DEBUG ================");
-        console.log("📩 Message type:", Object.keys(message.message || {}));
-        console.log("📝 Current text:", text);
-        console.log(
-          "📣 mentionedJid:",
-          JSON.stringify(
-            chatbotContextInfo?.mentionedJid || [],
-            null,
-            2
-          )
-        );
-        console.log(
-          "↩️ participant:",
-          chatbotContextInfo?.participant || "(none)"
-        );
-        console.log(
-          "🆔 stanzaId:",
-          chatbotContextInfo?.stanzaId || "(none)"
-        );
-        console.log(
-          "💬 quotedMessage:",
-          JSON.stringify(
-            chatbotContextInfo?.quotedMessage || null,
-            null,
-            2
-          )
-        );
-        console.log(
-          "🔗 contextInfo keys:",
-          Object.keys(chatbotContextInfo || {})
-        );
-        console.log("=================================================\n");
-
-
         const chatbotGroupJid =
           message.key.remoteJid;
 
@@ -4810,7 +4772,7 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
             );
 
           // --------------------------------------------
-          // 🧠 EXACT REPLIED-TO MESSAGE
+          // 🧠 EXACT REPLIED-TO MESSAGE + REAL SENDER
           // --------------------------------------------
           const quotedMessage =
             chatbotContextInfo?.quotedMessage || null;
@@ -4818,19 +4780,139 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           const getQuotedText = (quoted) => {
             if (!quoted) return "";
 
+            const unwrap = (obj) => {
+              if (!obj) return null;
+
+              return (
+                obj.ephemeralMessage?.message ||
+                obj.viewOnceMessage?.message ||
+                obj.viewOnceMessageV2?.message ||
+                obj.documentWithCaptionMessage?.message ||
+                obj
+              );
+            };
+
+            const q = unwrap(quoted);
+
             return (
-              quoted.conversation ||
-              quoted.extendedTextMessage?.text ||
-              quoted.imageMessage?.caption ||
-              quoted.videoMessage?.caption ||
-              quoted.documentMessage?.caption ||
-              quoted.documentWithCaptionMessage?.message?.documentMessage?.caption ||
+              q?.conversation ||
+              q?.extendedTextMessage?.text ||
+              q?.imageMessage?.caption ||
+              q?.videoMessage?.caption ||
+              q?.documentMessage?.caption ||
+              q?.documentWithCaptionMessage?.message?.documentMessage?.caption ||
               ""
             ).trim();
           };
 
           const quotedText =
             getQuotedText(quotedMessage);
+
+          // --------------------------------------------
+          // 👤 RESOLVE QUOTED SENDER FROM GROUP METADATA
+          // --------------------------------------------
+          let quotedSenderName = "";
+          let quotedSenderJid = "";
+
+          if (quotedParticipant) {
+            try {
+              const metadata =
+                await sock.groupMetadata(
+                  chatbotGroupJid
+                );
+
+              const participants =
+                metadata?.participants || [];
+
+              const normalizeForMatch = (jid) => {
+                if (!jid) return "";
+
+                return String(jid)
+                  .trim()
+                  .replace(/:\d+(?=@)/, "");
+              };
+
+              const normalizedQuoted =
+                normalizeForMatch(
+                  quotedParticipant
+                );
+
+              const quotedParticipantData =
+                participants.find(participant => {
+                  const ids = [
+                    participant?.id,
+                    participant?.lid,
+                    participant?.phoneNumber
+                  ].filter(Boolean);
+
+                  return ids.some(id =>
+                    normalizeForMatch(id) ===
+                    normalizedQuoted
+                  );
+                });
+
+              quotedSenderJid =
+                quotedParticipantData?.id ||
+                quotedParticipantData?.phoneNumber ||
+                quotedParticipantData?.lid ||
+                quotedParticipant;
+
+              quotedSenderName =
+                quotedParticipantData?.notify ||
+                quotedParticipantData?.name ||
+                quotedParticipantData?.verifiedName ||
+                quotedParticipantData?.displayName ||
+                "";
+
+              if (!quotedSenderName) {
+                quotedSenderName =
+                  quotedSenderJid
+                    .split("@")[0]
+                    .replace(/:\d+$/, "");
+              }
+            } catch (err) {
+              logger.warn(
+                {
+                  error: err.message,
+                  quotedParticipant
+                },
+                "Could not resolve quoted sender"
+              );
+            }
+          }
+
+          // --------------------------------------------
+          // 🧹 REMOVE RAW WHATSAPP MENTION IDS
+          // --------------------------------------------
+          const cleanAiInput = (input) => {
+            let cleaned = String(input || "");
+
+            for (const jid of mentionedJids) {
+              const bare =
+                bareJid(jid).split("@")[0];
+
+              if (!bare) continue;
+
+              const escaped =
+                bare.replace(
+                  /[.*+?^${}()|[\]\\]/g,
+                  "\\$&"
+                );
+
+              cleaned =
+                cleaned.replace(
+                  new RegExp(`@${escaped}\\b`, "g"),
+                  ""
+                );
+            }
+
+            return cleaned
+              .replace(/\s{2,}/g, " ")
+              .trim();
+          };
+
+          const cleanUserMessage =
+            cleanAiInput(text);
 
           // --------------------------------------------
           // 🤖 SILVER'S LAST MESSAGE
@@ -4843,8 +4925,12 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
           const conversationContext =
             [
               quotedText
-                ? `MESSAGE BEING REPLIED TO:\n${quotedText}`
+                ? `MESSAGE BEING REPLIED TO:\n${quotedSenderName ? `${quotedSenderName}: ` : ""}${quotedText}`
                 : "MESSAGE BEING REPLIED TO:\nNone",
+
+              quotedSenderName
+                ? `REPLIED-TO SENDER:\n${quotedSenderName}`
+                : "REPLIED-TO SENDER:\nUnknown",
 
               lastSilverMessage
                 ? `SILVER'S LAST MESSAGE:\n${lastSilverMessage}`
@@ -4855,33 +4941,49 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
                 : "RECENT GROUP CONVERSATION:\nNone"
             ].join("\n\n");
 
+          logger.info(
+            {
+              currentMessage: cleanUserMessage,
+              quotedText,
+              quotedSenderName,
+              quotedSenderJid
+            },
+            "🧠 Silver AI context prepared"
+          );
+
           // 🤖 Ask Silver AI with automatic Groq ↔ Gemini fallback.
           const aiReply = await askSilverAI(
-            text || "Say something playful.",
+            cleanUserMessage || "Say something playful.",
             conversationContext
           );
 
           if (aiReply) {
-            recordChatbotUsage(
-              chatbotGroupJid
-            );
+            let finalAiReply =
+              String(aiReply).trim();
+
+            // Never allow the AI to leak raw WhatsApp numeric IDs.
+            finalAiReply =
+              finalAiReply
+                .replace(/@\d{6,20}/g, "")
+                .replace(/\s{2,}/g, " ")
+                .trim();
 
             // 💬 Reply directly to the message that triggered Silver.
             await sock.sendMessage(
               chatbotGroupJid,
               {
-                text: aiReply
+                text: finalAiReply
               },
               {
                 quoted: message
               }
             );
 
-            // 🧠 Remember this so the next reply can understand
+          // 🧠 Remember this so the next reply can understand
             // exactly what Silver said previously.
             lastSilverMessageByGroup.set(
               chatbotGroupJid,
-              aiReply
+              finalAiReply
             );
           }
 
