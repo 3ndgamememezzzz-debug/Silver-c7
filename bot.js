@@ -167,7 +167,16 @@ Notice that Silver does NOT force jokes into every situation.
 ━━━━━━━━━━━━━━━━━━━━
 
 IMPORTANT:
-Never create, guess, or imitate WhatsApp mention IDs.
+
+You may mention people by their normal name when their name is available in the conversation.
+
+For example:
+"@John 😂"
+"@Success you really said that 😭"
+
+If you mention someone, write @ followed by their normal name.
+
+NEVER create, guess, or imitate WhatsApp numeric mention IDs.
 
 NEVER write things like:
 @568334566
@@ -176,11 +185,11 @@ NEVER write things like:
 
 Do NOT invent @numbers from JIDs, phone numbers, IDs, or context.
 
-If you want to address someone, use their normal name instead.
+Only use @Name when the person's actual name is available from the conversation context.
 
-If a person's name is available in the conversation context, say their name naturally.
+Never invent a person's name just to create a mention.
 
-Never attempt to create a WhatsApp mention yourself.
+The bot will handle converting valid @Name mentions into real WhatsApp mentions.
 
 ━━━━━━━━━━━━━━━━━━━━
 🧠 CONTEXT ACCURACY
@@ -4968,18 +4977,110 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
                 .replace(/\s{2,}/g, " ")
                 .trim();
 
+            // --------------------------------------------
+            // 🏷️ RESOLVE AI @NAME MENTIONS TO REAL JIDS
+            // --------------------------------------------
+            const aiMentionJids = [];
+
+            try {
+              const mentionMetadata =
+                await sock.groupMetadata(chatbotGroupJid);
+
+              const mentionParticipants =
+                mentionMetadata?.participants || [];
+
+              const normalizeMentionJid = (jid) => {
+                if (!jid) return "";
+
+                return String(jid)
+                  .trim()
+                  .replace(/:\d+(?=@)/, "");
+              };
+
+              const mentionCandidates = [];
+
+              for (const participant of mentionParticipants) {
+                if (!participant) continue;
+
+                const displayName =
+                  participant?.notify ||
+                  participant?.name ||
+                  participant?.verifiedName ||
+                  participant?.displayName ||
+                  "";
+
+                const jid =
+                  participant?.id ||
+                  participant?.phoneNumber ||
+                  participant?.lid ||
+                  "";
+
+                if (!displayName || !jid) continue;
+
+                mentionCandidates.push({
+                  name: String(displayName).trim(),
+                  jid: normalizeMentionJid(jid)
+                });
+              }
+
+              // Longest names first so names containing other names
+              // are resolved correctly.
+              mentionCandidates.sort(
+                (a, b) => b.name.length - a.name.length
+              );
+
+              for (const candidate of mentionCandidates) {
+                const escapedName =
+                  candidate.name.replace(
+                    /[.*+?^${}()|[\]\\]/g,
+                    "\\$&"
+                  );
+
+                const mentionRegex =
+                  new RegExp(
+                    `@${escapedName}(?=$|[\\s.,!?;:)}\\]😂😭💀🤣❤️💕])`,
+                    "gi"
+                  );
+
+                if (mentionRegex.test(finalAiReply)) {
+                  finalAiReply =
+                    finalAiReply.replace(
+                      mentionRegex,
+                      `@${candidate.name}`
+                    );
+
+                  if (
+                    candidate.jid &&
+                    !aiMentionJids.includes(candidate.jid)
+                  ) {
+                    aiMentionJids.push(candidate.jid);
+                  }
+                }
+              }
+            } catch (mentionError) {
+              logger.warn(
+                {
+                  error: mentionError?.message || mentionError
+                },
+                "Could not resolve Silver AI mentions"
+              );
+            }
+
             // 💬 Reply directly to the message that triggered Silver.
             await sock.sendMessage(
               chatbotGroupJid,
               {
-                text: finalAiReply
+                text: finalAiReply,
+                ...(aiMentionJids.length
+                  ? { mentions: aiMentionJids }
+                  : {})
               },
               {
                 quoted: message
               }
             );
 
-          // 🧠 Remember this so the next reply can understand
+            // 🧠 Remember this so the next reply can understand
             // exactly what Silver said previously.
             lastSilverMessageByGroup.set(
               chatbotGroupJid,
