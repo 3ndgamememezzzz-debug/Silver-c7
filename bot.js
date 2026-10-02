@@ -658,9 +658,14 @@ const antiTagGroups = {};
 
 // Anti-Spam Settings (for groups) - { groupJid: 'kick'|'warn'|false }
 const antiSpamGroups = {};
-const spamTracker = new Map(); // { 'groupJid:senderJid': { count, firstMsgTime, lastWarnTime } }
-const SPAM_THRESHOLD = 8; // messages within time window
-const SPAM_WINDOW = 5000; // 5 seconds
+
+// Anti-Spam burst tracker
+// key = groupJid:senderJid
+// value = { messages: [{ key, timestamp }], lastWarnTime }
+const spamTracker = new Map();
+
+const SPAM_THRESHOLD = 5; // trigger on the 5th message
+const SPAM_WINDOW = 2000; // 2 seconds
 
 // ============================================
 // 🤖 ANTI-BOT SYSTEM
@@ -2928,8 +2933,6 @@ cron.schedule("0 6 * * *", async () => {
 }, {
   timezone: "Africa/Lagos"
 });
-        // Weekly Activity Reset - Every Monday at 12:00 AM (Nigeria time)
-  cron.schedule("0 0 * * 1", async () => {
     // Ghost Warning - Every Friday at 8:00 PM (Nigeria time)
 cron.schedule("0 20 * * 5", async () => {
 
@@ -3094,6 +3097,8 @@ await currentSock.sendMessage(groupId, {
 }, {
   timezone: "Africa/Lagos"
 });
+// Weekly Activity Reset - Every Monday at 12:00 AM (Nigeria time)
+cron.schedule("0 0 * * 1", async () => {
     logger.info("📊 Weekly Activity Reset started.");
 
     for (const groupId in groupActivity) {
@@ -3565,6 +3570,20 @@ Please read the group rules and enjoy your stay!`;
               `Could not resolve EXP leave LID ${participantJid}: ${err.message}`
             );
           }
+        }
+
+        // Remove this member's weekly activity records separately from EXP.
+        for (const activityJid of possibleJids) {
+          if (groupActivity[groupJid]) {
+            delete groupActivity[groupJid][activityJid];
+          }
+        }
+
+        if (
+          groupActivity[groupJid] &&
+          Object.keys(groupActivity[groupJid]).length === 0
+        ) {
+          delete groupActivity[groupJid];
         }
 
         for (const userJid of possibleJids) {
@@ -4452,6 +4471,39 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         text = message.message.videoMessage.caption;
 
       // ============================================
+      // 📊 ACTIVITY TRACKING — COUNT GROUP MESSAGES
+      // ============================================
+      if (
+        isGroup &&
+        !message.key.fromMe &&
+        activityTracking[message.key.remoteJid] === true &&
+        sender &&
+        sender !== message.key.remoteJid
+      ) {
+        const activityGroupId = message.key.remoteJid;
+
+        if (!groupActivity[activityGroupId]) {
+          groupActivity[activityGroupId] = {};
+        }
+
+        if (!groupActivity[activityGroupId][sender]) {
+          groupActivity[activityGroupId][sender] = {
+            count: 0,
+            lastMessage: null
+          };
+        }
+
+        const activityUser = groupActivity[activityGroupId][sender];
+
+        activityUser.count =
+          (Number(activityUser.count) || 0) + 1;
+
+        activityUser.lastMessage = Date.now();
+
+        saveData();
+      }
+
+      // ============================================
       // 🤖 TEMP CHATBOT TRIGGER DEBUG
       // ============================================
       // ============================================
@@ -4723,10 +4775,7 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         const chatbotTriggered =
           mentionedBot || repliedToBot;
 
-        if (!chatbotTriggered) {
-          return;
-        }
-
+        if (chatbotTriggered) {
         logger.info(
           {
             group: chatbotGroupJid,
@@ -5113,6 +5162,7 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         }
 
         return;
+        }
       }
 
       // ============================================
@@ -5504,6 +5554,102 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
 
         const settings = adminSettings[message.key.remoteJid];
         const antilinkMode = settings?.antilink; // 'kick', 'warn', or false/undefined
+
+        // ============================================================
+        // 🧪 RAILWAY ANTI-FEATURE DIAGNOSTICS
+        // DIAGNOSTIC ONLY — DOES NOT CHANGE ENFORCEMENT
+        // ============================================================
+        try {
+          const debugGroupId = message.key.remoteJid;
+          const debugMsg = message.message || {};
+
+          const debugFeatures = {
+            antilink: adminSettings[debugGroupId]?.antilink || false,
+            antiphoto: antiPhotoGroups[debugGroupId] || false,
+            antistatus: antiStatusGroups[debugGroupId] || false,
+            antitag: antiTagGroups[debugGroupId] || false,
+            antispam: antiSpamGroups[debugGroupId] || false
+          };
+
+          const debugGate = (enabled) => ({
+            enabled: Boolean(enabled),
+            isAdmin: Boolean(isAdmin),
+            isGroupAdmin: Boolean(isGroupAdmin),
+            isOwner: Boolean(isOwner),
+            canUseAsOwner: Boolean(canUseAsOwner),
+            fromMe: Boolean(message.key.fromMe),
+            bypass: Boolean(isAdmin || canUseAsOwner || message.key.fromMe),
+            reason: !enabled
+              ? "FEATURE_DISABLED"
+              : (isAdmin || canUseAsOwner || message.key.fromMe)
+                ? "BYPASS_USER"
+                : "GATE_PASSED"
+          });
+
+          logger.info({
+            group: debugGroupId,
+            sender,
+            participant: message.key.participant || null,
+            messageId: message.key.id || null,
+
+            identity: {
+              isAdmin,
+              isGroupAdmin,
+              isOwner,
+              canUseAsOwner,
+              fromMe: Boolean(message.key.fromMe)
+            },
+
+            features: {
+              antilink: debugGate(debugFeatures.antilink),
+              antiphoto: debugGate(debugFeatures.antiphoto),
+              antistatus: debugGate(debugFeatures.antistatus),
+              antitag: debugGate(debugFeatures.antitag),
+              antispam: debugGate(debugFeatures.antispam)
+            },
+
+            message: {
+              keys: Object.keys(debugMsg),
+              text: typeof text === "string"
+                ? text.slice(0, 300)
+                : String(text || "").slice(0, 300),
+
+              mentionedJid:
+                debugMsg?.extendedTextMessage?.contextInfo?.mentionedJid ||
+                debugMsg?.imageMessage?.contextInfo?.mentionedJid ||
+                debugMsg?.videoMessage?.contextInfo?.mentionedJid ||
+                [],
+
+              hasImage: Boolean(debugMsg.imageMessage),
+              hasVideo: Boolean(debugMsg.videoMessage),
+              hasSticker: Boolean(debugMsg.stickerMessage),
+              hasText: Boolean(text)
+            }
+          }, "🧪 ANTI-FEATURE GATE DEBUG");
+        } catch (debugError) {
+          logger.error({
+            error: debugError?.message,
+            stack: debugError?.stack
+          }, "🧪 Anti-feature diagnostic failed");
+        }
+
+        // ============================================================
+        // END RAILWAY ANTI-FEATURE DIAGNOSTICS
+        // ============================================================
+        logger.info({
+          feature: "antilink",
+          enabled: Boolean(antilinkMode),
+          mode: antilinkMode || false,
+          isAdmin,
+          canUseAsOwner,
+          fromMe: Boolean(message.key.fromMe),
+          skippedBecause: !antilinkMode
+            ? "FEATURE_DISABLED"
+            : (isAdmin || canUseAsOwner || message.key.fromMe)
+              ? "BYPASS_USER"
+              : "GATE_PASSED"
+        }, "🧪 ANTILINK DECISION");
+
         if (antilinkMode && !isAdmin && !canUseAsOwner && !message.key.fromMe) {
           if (isLinkMessage(text)) {
             const groupId = message.key.remoteJid;
@@ -5574,6 +5720,20 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
         // Anti-Photo Enforcement (delete images/videos that are not view-once)
         // ============================================
         const antiPhotoAction = antiPhotoGroups[message.key.remoteJid];
+        logger.info({
+          feature: "antiphoto",
+          enabled: Boolean(antiPhotoAction),
+          mode: antiPhotoAction || false,
+          isAdmin,
+          canUseAsOwner,
+          fromMe: Boolean(message.key.fromMe),
+          skippedBecause: !antiPhotoAction
+            ? "FEATURE_DISABLED"
+            : (isAdmin || canUseAsOwner || message.key.fromMe)
+              ? "BYPASS_USER"
+              : "GATE_PASSED"
+        }, "🧪 ANTIPHOTO DECISION");
+
         if (antiPhotoAction && !isAdmin && !canUseAsOwner && !message.key.fromMe) {
           // Check for view-once wrappers first — these should ALWAYS be allowed
           console.log("MESSAGE KEYS:", Object.keys(message.message || {}));
@@ -5656,6 +5816,20 @@ const isViewOnce =
 console.log('MESSAGE TYPE:', Object.keys(message.message || {}));
         
         const antiStatusAction = antiStatusGroups[message.key.remoteJid];
+        logger.info({
+          feature: "antistatus",
+          enabled: Boolean(antiStatusAction),
+          mode: antiStatusAction || false,
+          isAdmin,
+          canUseAsOwner,
+          fromMe: Boolean(message.key.fromMe),
+          skippedBecause: !antiStatusAction
+            ? "FEATURE_DISABLED"
+            : (isAdmin || canUseAsOwner || message.key.fromMe)
+              ? "BYPASS_USER"
+              : "GATE_PASSED"
+        }, "🧪 ANTISTATUS DECISION");
+
         if (antiStatusAction && !isAdmin && !canUseAsOwner && !message.key.fromMe) {
           // Detect status share/mention messages in groups
           // When someone mentions a group in their status, WhatsApp sends the status to that group
@@ -5924,6 +6098,20 @@ console.log('MESSAGE TYPE:', Object.keys(message.message || {}));
         // Anti-Tag Enforcement (prevent tagging all members)
         // ============================================
         const antiTagAction = antiTagGroups[message.key.remoteJid];
+        logger.info({
+          feature: "antitag",
+          enabled: Boolean(antiTagAction),
+          mode: antiTagAction || false,
+          isAdmin,
+          canUseAsOwner,
+          fromMe: Boolean(message.key.fromMe),
+          skippedBecause: !antiTagAction
+            ? "FEATURE_DISABLED"
+            : (isAdmin || canUseAsOwner || message.key.fromMe)
+              ? "BYPASS_USER"
+              : "GATE_PASSED"
+        }, "🧪 ANTITAG DECISION");
+
         if (antiTagAction && !isAdmin && !canUseAsOwner && !message.key.fromMe) {
           const mentionedJids = message.message.extendedTextMessage?.contextInfo?.mentionedJid || [];
           const totalMembers = groupMetadata.participants.length;
@@ -5981,78 +6169,146 @@ console.log('MESSAGE TYPE:', Object.keys(message.message || {}));
         }
 
         // ============================================
-        // Anti-Spam Enforcement (rate-limit messages)
+        // Anti-Spam Enforcement
+        // 5 messages within 2 seconds = spam burst
         // ============================================
         const antiSpamAction = antiSpamGroups[message.key.remoteJid];
-        if (antiSpamAction && !isAdmin && !canUseAsOwner && !message.key.fromMe) {
+
+        logger.info({
+          feature: "antispam",
+          enabled: Boolean(antiSpamAction),
+          mode: antiSpamAction || false,
+          isAdmin,
+          canUseAsOwner,
+          fromMe: Boolean(message.key.fromMe),
+          skippedBecause: !antiSpamAction
+            ? "FEATURE_DISABLED"
+            : (isAdmin || canUseAsOwner || message.key.fromMe)
+              ? "BYPASS_USER"
+              : "GATE_PASSED"
+        }, "🧪 ANTISPAM DECISION");
+
+        if (
+          antiSpamAction &&
+          !isAdmin &&
+          !canUseAsOwner &&
+          !message.key.fromMe
+        ) {
           const groupId = message.key.remoteJid;
           const trackerKey = `${groupId}:${sender}`;
           const now = Date.now();
+
           let tracker = spamTracker.get(trackerKey);
 
-          if (!tracker || (now - tracker.firstMsgTime > SPAM_WINDOW)) {
-            // Reset window
-            tracker = { count: 1, firstMsgTime: now, lastWarnTime: 0 };
-            spamTracker.set(trackerKey, tracker);
-          } else {
-            tracker.count++;
+          if (!tracker) {
+            tracker = {
+              messages: [],
+              lastWarnTime: 0,
+            };
           }
 
-          if (tracker.count >= SPAM_THRESHOLD) {
+          // Remove messages outside the 2-second window.
+          tracker.messages = tracker.messages.filter(
+            item => now - item.timestamp <= SPAM_WINDOW
+          );
+
+          // Store this message's key so we can delete the
+          // entire burst when the 5th message arrives.
+          tracker.messages.push({
+            key: message.key,
+            timestamp: now,
+          });
+
+          spamTracker.set(trackerKey, tracker);
+
+          // Trigger exactly when 5 messages are inside
+          // the 2-second window.
+          if (tracker.messages.length >= SPAM_THRESHOLD) {
+            const spamMessages = [...tracker.messages];
             const userNumber = sender.split("@")[0];
 
-            // Delete the spam message
-            try {
-              await sock.sendMessage(groupId, { delete: message.key });
-            } catch (err) {
-              logger.error({ error: err.message }, 'Failed to delete spam message');
-            }
+            // Reset immediately so the same burst cannot
+            // trigger repeatedly while deletion is happening.
+            spamTracker.delete(trackerKey);
 
-            if (antiSpamAction === 'kick') {
-              try {
-                await sock.groupParticipantsUpdate(groupId, [sender], "remove");
-                await sock.sendMessage(groupId, {
-                  text: `🚫 @${userNumber} removed for spamming.`,
-                  mentions: [sender]
-                });
-              } catch (err) {
-                logger.error({ error: err.message }, 'Failed to kick user (antispam)');
-              }
-              spamTracker.delete(trackerKey);
-            } else if (antiSpamAction === 'warn') {
-              // Only warn once per spam burst (avoid spamming warnings)
-              if (now - tracker.lastWarnTime > 10000) {
-                tracker.lastWarnTime = now;
-                if (!userWarns[groupId]) userWarns[groupId] = {};
-                if (!userWarns[groupId][sender]) userWarns[groupId][sender] = 0;
+            // Delete ALL messages in the burst.
+            await Promise.allSettled(
+              spamMessages.map(item =>
+                sock.sendMessage(groupId, {
+                  delete: item.key,
+                })
+              )
+            );
+
+            // Warn the sender.
+            try {
+              if (antiSpamAction === "warn") {
+                if (!userWarns[groupId]) {
+                  userWarns[groupId] = {};
+                }
+
+                if (!userWarns[groupId][sender]) {
+                  userWarns[groupId][sender] = 0;
+                }
+
                 userWarns[groupId][sender]++;
+
                 const warnCount = userWarns[groupId][sender];
+
                 saveData();
 
+                await sock.sendMessage(groupId, {
+                  text: `⚠️ @${userNumber} slow down! Sending 5 messages within 2 seconds is considered spam.\n\nWarning ${warnCount}/3.`,
+                  mentions: [sender],
+                });
+
+                // Preserve the existing 3-warning kick system.
                 if (warnCount >= 3) {
                   try {
-                    await sock.groupParticipantsUpdate(groupId, [sender], "remove");
+                    await sock.groupParticipantsUpdate(
+                      groupId,
+                      [sender],
+                      "remove"
+                    );
+
                     await sock.sendMessage(groupId, {
-                      text: `🚫 @${userNumber} removed (3 spam warnings).`,
-                      mentions: [sender]
+                      text: `🚫 @${userNumber} removed after 3 spam warnings.`,
+                      mentions: [sender],
                     });
+
                     delete userWarns[groupId][sender];
                     saveData();
                   } catch (err) {
-                    logger.error({ error: err.message }, 'Failed to kick user (antispam warn)');
+                    logger.error(
+                      { error: err.message },
+                      "Failed to kick user after antispam warnings"
+                    );
                   }
-                  spamTracker.delete(trackerKey);
-                } else {
-                  await sock.sendMessage(groupId, {
-                    text: `⚠️ Warning ${warnCount}/3 @${userNumber} - Slow down! No spamming.`,
-                    mentions: [sender]
-                  });
                 }
+              } else if (antiSpamAction === "kick") {
+                await sock.sendMessage(groupId, {
+                  text: `⚠️ @${userNumber} was detected spamming. Slow down.`,
+                  mentions: [sender],
+                });
+
+                await sock.groupParticipantsUpdate(
+                  groupId,
+                  [sender],
+                  "remove"
+                );
+
+                await sock.sendMessage(groupId, {
+                  text: `🚫 @${userNumber} removed for spamming.`,
+                  mentions: [sender],
+                });
               }
+            } catch (err) {
+              logger.error(
+                { error: err.message },
+                "Failed to warn/kick antispam user"
+              );
             }
-            // Reset count after action
-            tracker.count = 0;
-            tracker.firstMsgTime = now;
+
             return;
           }
         }
@@ -6314,43 +6570,78 @@ ${dmBlockerMessage}`
         // List Active Members
         // ============================================
         if (command === "listactive") {
-          if (!isGroup) {
-            await sock.sendMessage(message.key.remoteJid, {
-              text: "❌ This command only works in groups."
-            });
-            return;
-          }
+  if (!isGroup) {
+    await sock.sendMessage(message.key.remoteJid, {
+      text: "❌ This command only works in groups."
+    });
+    return;
+  }
 
-          const groupId = message.key.remoteJid;
-          const activity = groupActivity[groupId] || {};
+  const groupId = message.key.remoteJid;
+  let groupMeta;
 
-          if (Object.keys(activity).length === 0) {
-            await sock.sendMessage(message.key.remoteJid, {
-              text: "No activity has been recorded yet."
-            });
-            return;
-          }
+  try {
+    groupMeta = await sock.groupMetadata(groupId);
+  } catch (err) {
+    logger.warn(`Could not load members for activity list: ${err.message}`);
+    await sock.sendMessage(groupId, {
+      text: "❌ I couldn't verify the current group members. Please try again."
+    });
+    return;
+  }
 
-          const sorted = Object.entries(activity)
-            .sort((a, b) => b[1].count - a[1].count);
+  // Include the identifiers exposed by the current group metadata.
+  const currentJids = new Set();
 
-          let text = "📊 *ACTIVE MEMBERS*\n\n";
-          const mentions = [];
+  for (const participant of (groupMeta.participants || [])) {
+    for (const value of [
+      participant?.id,
+      participant?.jid,
+      participant?.lid,
+      participant?.phoneNumber
+    ]) {
+      if (typeof value !== "string" || !value.trim()) continue;
 
-          sorted.forEach(([jid, data], index) => {
-            mentions.push(jid);
-            text += `${index + 1}. @${jid.split("@")[0]} — ${data.count} messages\n`;
-          });
+      currentJids.add(value);
 
-          await sock.sendMessage(message.key.remoteJid, {
-            text,
-            mentions
-          });
+      // Some metadata exposes a phone number without its JID suffix.
+      if (/^\d+$/.test(value)) {
+        currentJids.add(`${value}@s.whatsapp.net`);
+      }
+    }
+  }
 
-          return;
-        }
-        
-        // ============================================
+  const activity = groupActivity[groupId] || {};
+
+  // Only display records matching identifiers of current group members.
+  const sorted = Object.entries(activity)
+    .filter(([jid, data]) =>
+      currentJids.has(jid) &&
+      data &&
+      Number.isFinite(Number(data.count)) &&
+      Number(data.count) >= 0
+    )
+    .sort((a, b) => Number(b[1].count) - Number(a[1].count));
+
+  if (sorted.length === 0) {
+    await sock.sendMessage(groupId, {
+      text: "No activity has been recorded for current members yet."
+    });
+    return;
+  }
+
+  let text = "📊 *ACTIVE MEMBERS*\n\n";
+  const mentions = [];
+
+  sorted.forEach(([jid, data], index) => {
+    mentions.push(jid);
+    text += `${index + 1}. @${jid.split("@")[0]} — ${Number(data.count)} messages\n`;
+  });
+
+  await sock.sendMessage(groupId, { text, mentions });
+  return;
+}
+
 // EXP SYSTEM CONTROL
 // ============================================
 if (command === "exp") {
