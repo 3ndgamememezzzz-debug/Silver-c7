@@ -3104,16 +3104,48 @@ cron.schedule("0 0 * * 1", async () => {
     for (const groupId in groupActivity) {
       if (!activityTracking[groupId]) continue;
 
-  for (const userId in groupActivity[groupId]) {
+      try {
+        // Fetch the CURRENT members so departed users are removed
+        // and the new activity week starts with a clean slate.
+        const groupMetadata = await currentSock.groupMetadata(groupId);
 
-    // Reset only the weekly message count
-    groupActivity[groupId][userId].count = 0;
+        const freshActivity = {};
 
-  }
+        for (const participant of (groupMetadata.participants || [])) {
+          const participantJid =
+            typeof participant === "string"
+              ? participant
+              : participant?.id ||
+                participant?.jid ||
+                participant?.lid ||
+                participant?.phoneNumber;
 
-  try {
+          if (
+            !participantJid ||
+            typeof participantJid !== "string"
+          ) {
+            continue;
+          }
 
-    await currentSock.sendMessage(groupId, {
+          // Keep the bot out of the activity records.
+          if (
+            normalizeJid(participantJid) ===
+            normalizeJid(currentSock.user?.id || "")
+          ) {
+            continue;
+          }
+
+          freshActivity[participantJid] = {
+            count: 0,
+            lastMessage: null
+          };
+        }
+
+        // Replace the old activity object completely.
+        // This removes members who have left the group.
+        groupActivity[groupId] = freshActivity;
+
+        await currentSock.sendMessage(groupId, {
       text: `╭━━━〔 📊 WEEKLY ACTIVITY RESET 〕━━━╮
 
 🎉 *A new activity week has begun!*
@@ -3140,7 +3172,10 @@ cron.schedule("0 0 * * 1", async () => {
 
 }
 
+    // Persist the reset to BOTH local storage and Supabase.
+    // This prevents old activity counts from returning after a restart.
     saveData();
+    await saveGlobalSettingsToSupabase();
 
     logger.info("✅ Weekly Activity Reset completed.");
 
@@ -4476,6 +4511,8 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
       if (
         isGroup &&
         !message.key.fromMe &&
+        !message.message?.reactionMessage &&
+        !message.message?.protocolMessage &&
         activityTracking[message.key.remoteJid] === true &&
         sender &&
         sender !== message.key.remoteJid
