@@ -36,6 +36,10 @@ const groq = new Groq({
 const GEMINI_MODEL = "gemini-3.6-flash";
 const GROQ_MODEL = "openai/gpt-oss-20b";
 
+// Vision models used only when Silver needs to analyze an image.
+const GROQ_VISION_MODEL = "qwen/qwen3.8-27b";
+const GEMINI_VISION_MODEL = GEMINI_MODEL;
+
 // Keep track of providers that temporarily hit quota/rate limits.
 const aiProviderCooldown = {
   groq: 0,
@@ -384,6 +388,183 @@ ${userMessage}`;
 
   return null;
 }
+// ============================================
+// 🖼️ SILVER DUAL IMAGE VISION
+// ============================================
+async function askSilverVision(
+  imageBuffer,
+  userQuestion = "",
+  context = "",
+  mimeType = "image/jpeg"
+) {
+  if (!imageBuffer) {
+    return null;
+  }
+
+  const imageBase64 =
+    imageBuffer.toString("base64");
+
+  const safeMimeType =
+    typeof mimeType === "string" &&
+    mimeType.startsWith("image/")
+      ? mimeType
+      : "image/jpeg";
+
+  const imageDataUrl =
+    `data:${safeMimeType};base64,${imageBase64}`;
+
+  const prompt =
+`${SILVER_AI_SYSTEM_PROMPT}
+
+${context ? `RECENT CONTEXT:\n${context}\n\n` : ""}
+
+The user sent an image.
+
+Look carefully at the image and use only what you can actually see.
+Answer the user's question naturally like Silver.
+Do not claim to see anything that is not visible.
+
+USER QUESTION:
+${userQuestion || "What's in this image?"}`;
+
+  const providers = [];
+
+  // Groq Vision first.
+  if (process.env.GROQ_API_KEY) {
+    providers.push("groq");
+  }
+
+  // Gemini Vision fallback.
+  if (process.env.GEMINI_API_KEY) {
+    providers.push("gemini");
+  }
+
+  if (!providers.length) {
+    console.error(
+      "❌ Silver Vision: no vision provider API keys available."
+    );
+    return null;
+  }
+
+  for (const provider of providers) {
+    try {
+      // ==========================================
+      // GROQ VISION
+      // ==========================================
+
+      if (provider === "groq") {
+        console.log("🖼️ Silver Vision trying GROQ...");
+
+        const response =
+          await groq.chat.completions.create({
+            model: GROQ_VISION_MODEL,
+            messages: [
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: prompt
+                  },
+                  {
+                    type: "image_url",
+                    image_url: {
+                      url: imageDataUrl
+                    }
+                  }
+                ]
+              }
+            ],
+            max_completion_tokens: 600,
+            temperature: 0.7
+          });
+
+        const reply =
+          response?.choices?.[0]?.message?.content?.trim();
+
+        if (reply) {
+          console.log(
+            "✅ Silver Vision replied using GROQ."
+          );
+          return reply;
+        }
+
+        console.error(
+          "❌ Groq Vision returned an empty response."
+        );
+      }
+
+      // ==========================================
+      // GEMINI VISION
+      // ==========================================
+
+      if (provider === "gemini") {
+        console.log("🖼️ Silver Vision trying GEMINI...");
+
+        const response =
+          await gemini.models.generateContent({
+            model: GEMINI_VISION_MODEL,
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: prompt
+                  },
+                  {
+                    inlineData: {
+                      mimeType: safeMimeType,
+                      data: imageBase64
+                    }
+                  }
+                ]
+              }
+            ]
+          });
+
+        const reply =
+          response?.text?.trim();
+
+        if (reply) {
+          console.log(
+            "✅ Silver Vision replied using GEMINI."
+          );
+          return reply;
+        }
+
+        console.error(
+          "❌ Gemini Vision returned an empty response."
+        );
+      }
+
+    } catch (error) {
+      const status =
+        error?.status ||
+        error?.statusCode ||
+        error?.code ||
+        "";
+
+      console.error(
+        `❌ ${provider.toUpperCase()} Vision error:`,
+        error?.message || error
+      );
+
+      // Continue to the next vision provider.
+      if (status === 429 || status === 413) {
+        console.log(
+          `⏭️ Silver Vision moving from ${provider.toUpperCase()} to fallback.`
+        );
+      }
+    }
+  }
+
+  console.error(
+    "❌ Silver Vision: all vision providers failed."
+  );
+
+  return null;
+}
+
 const path = require("path");
 const sharp = require("sharp");
 const youtubedl = require('youtube-dl-exec');
@@ -5045,6 +5226,93 @@ antiDelMsg += `🆔 *User:* ${senderNumber}\n`;
             },
             "🧠 Silver AI context prepared"
           );
+
+          // ============================================
+          // 🖼️ SILVER IMAGE VISION
+          // ============================================
+          let silverImageBuffer = null;
+          let imageMessage = null;
+
+          try {
+            const directImage =
+              message.message?.imageMessage;
+
+            const quotedImage =
+              message.message
+                ?.extendedTextMessage
+                ?.contextInfo
+                ?.quotedMessage
+                ?.imageMessage;
+
+            imageMessage =
+              directImage || quotedImage;
+
+            if (imageMessage) {
+              const stream =
+                await downloadContentFromMessage(
+                  imageMessage,
+                  "image"
+                );
+
+              const chunks = [];
+
+              for await (const chunk of stream) {
+                chunks.push(chunk);
+              }
+
+              silverImageBuffer =
+                Buffer.concat(chunks);
+
+              logger.info(
+                "🖼️ Silver Vision image downloaded."
+              );
+            }
+
+          } catch (err) {
+            logger.error(
+              { error: err?.message || err },
+              "Silver Vision image download failed"
+            );
+          }
+
+          if (silverImageBuffer) {
+            const visionReply =
+              await askSilverVision(
+                silverImageBuffer,
+                cleanUserMessage,
+                conversationContext,
+                imageMessage?.mimetype || "image/jpeg"
+              );
+
+            if (visionReply) {
+              let finalVisionReply =
+                String(visionReply).trim();
+
+              // Never allow the AI to leak raw WhatsApp numeric IDs.
+              finalVisionReply =
+                finalVisionReply
+                  .replace(/@\d{6,20}/g, "")
+                  .replace(/\s{2,}/g, " ")
+                  .trim();
+
+              await sock.sendMessage(
+                chatbotGroupJid,
+                {
+                  text: finalVisionReply
+                },
+                {
+                  quoted: message
+                }
+              );
+
+              lastSilverMessageByGroup.set(
+                chatbotGroupJid,
+                finalVisionReply
+              );
+
+              return;
+            }
+          }
 
           // 🤖 Ask Silver AI with automatic Groq ↔ Gemini fallback.
           const aiReply = await askSilverAI(
